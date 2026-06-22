@@ -1,0 +1,7 @@
+rules:
+  - id: ppf.transparent_material
+    severity: blocker
+    text: PPF must appear nearly transparent and protective, never like thick plastic, glass sheet, liquid coating, or vinyl wrap.
+  - id: ppf.visibility_cues
+    severity: major
+    text: Show PPF through edge highlights, subtle gloss, water beading, installation action, or preserved paint reflections.

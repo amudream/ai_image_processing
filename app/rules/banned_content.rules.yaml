@@ -1,0 +1,13 @@
+rules:
+  - id: banned.logo
+    severity: blocker
+    text: No logos, brand marks, platform marks, or watermarks.
+  - id: banned.plate
+    severity: blocker
+    text: No readable license plates.
+  - id: banned.text_qr
+    severity: blocker
+    text: No readable text, QR codes, or barcodes.
+  - id: banned.fake_claims
+    severity: blocker
+    text: No fake certification, legal, OEM, factory-installed, or guaranteed-performance claims.

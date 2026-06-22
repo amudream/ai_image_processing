@@ -1,0 +1,7 @@
+rules:
+  - id: tint.realistic_darkness
+    severity: blocker
+    text: Window tint must have realistic glass darkness and reasonable visibility.
+  - id: tint.no_black_board
+    severity: major
+    text: Do not render glass as a flat opaque black board unless the brief explicitly requests a privacy scene.

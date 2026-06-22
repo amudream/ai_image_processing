@@ -1,0 +1,6 @@
+allowlist: []
+default_policy: reject_unsupported_claims
+rules:
+  - id: claims.no_unsupported_numbers
+    severity: blocker
+    text: Numerical performance claims are forbidden unless present in the approved allowlist.

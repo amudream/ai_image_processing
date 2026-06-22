@@ -1,0 +1,7 @@
+rules:
+  - id: wrap.preserve_finish
+    severity: blocker
+    text: Color wrap must preserve color_family and finish; satin, matte, gloss, metallic, pearl, chrome, carbon fiber, and chameleon cannot be mixed.
+  - id: wrap.body_reflections
+    severity: major
+    text: Reflections must follow real vehicle body curvature without toy-car, CGI, or plastic-shell appearance.
