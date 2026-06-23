@@ -26,7 +26,11 @@ class Settings(BaseSettings):
     stage_max_inflight_generation: int = 4
     stage_max_inflight_qa: int = 16
     stage_max_inflight_publish: int = 4
+    sqlite_busy_timeout_ms: int = 60000
+    sqlite_wal_enabled: bool = True
     openai_max_retries: int = 3
+    openai_retry_initial_delay_seconds: float = 2.0
+    openai_retry_max_delay_seconds: float = 60.0
     openai_request_timeout_seconds: int = 180
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str | None = None

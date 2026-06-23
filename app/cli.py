@@ -9,11 +9,14 @@ import typer
 from sqlalchemy import select
 
 from app.adapters.ai_watermark_detection import build_ai_watermark_identifier
+from app.adapters.image_generation import build_image_generation_adapter
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import VisualUnit
+from app.services.acceptance_policy_service import AcceptancePolicyService
 from app.services.analysis_service import AnalysisService
 from app.services.brief_service import VisualDirectorService
+from app.services.color_card_production_service import ColorCardProductionService
 from app.services.color_card_service import ColorCardProfileBuilder
 from app.services.demo_data import ensure_demo_images
 from app.services.generation_service import GenerationService
@@ -212,6 +215,40 @@ def export_report(path: Path) -> None:
     typer.echo(f"Reports exported: {report_paths}")
 
 
+@app.command("run-acceptance-loop")
+def run_acceptance_loop(
+    report_dir: Annotated[Path | None, typer.Option()] = None,
+    published_dir: Annotated[Path, typer.Option()] = Path("data/published"),
+    apply: Annotated[
+        bool,
+        typer.Option("--apply/--dry-run"),
+    ] = False,
+    limit: Annotated[int | None, typer.Option()] = None,
+) -> None:
+    ensure_database()
+    active_report_dir = report_dir or (
+        Path("data/reports")
+        / datetime.now(UTC).strftime("acceptance_loop_%Y%m%dT%H%M%SZ")
+    )
+    with SessionLocal() as db:
+        result = AcceptancePolicyService(db).run(
+            report_dir=active_report_dir,
+            published_dir=published_dir,
+            apply=apply,
+            limit=limit,
+        )
+    typer.echo(
+        "Acceptance loop complete: "
+        f"reviewed={result.reviewed} "
+        f"published={result.published} "
+        f"status_counts={result.status_counts}"
+    )
+    typer.echo(
+        "Acceptance loop artifacts exported: "
+        f"summary={result.summary_path} rows={result.rows_path} log={result.log_path}"
+    )
+
+
 @app.command("enrich-color-card-catalog")
 def enrich_color_card_catalog(
     catalog_path: Annotated[Path | None, typer.Option()] = None,
@@ -265,6 +302,138 @@ def classify_source_library(
         f"summary={result.summary_path} "
         f"html={result.html_report_path}"
     )
+
+
+@app.command("plan-color-card-production")
+def plan_color_card_production(
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260622/classification_manifest.csv"),
+    catalog_path: Annotated[Path | None, typer.Option()] = None,
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    active_catalog_path = catalog_path or Path(settings.color_card_catalog_path)
+    active_output_dir = output_dir or (
+        Path("data/production_runs")
+        / datetime.now(UTC).strftime("color_card_production_%Y%m%dT%H%M%SZ")
+    )
+    result = ColorCardProductionService(
+        classification_path=classification_path,
+        catalog_path=active_catalog_path,
+    ).plan(active_output_dir)
+    typer.echo(
+        "Color-card production plan complete: "
+        f"total_plan_rows={result.total_plan_rows}"
+    )
+    typer.echo(
+        "Color-card production artifacts exported: "
+        f"production_plan={result.production_plan_path} "
+        f"generation_requests={result.generation_requests_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path}"
+    )
+
+
+@app.command("plan-color-card-recovery")
+def plan_color_card_recovery(
+    original_plan_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/production_runs/color_card_production_20260622/production_plan.csv"),
+    failure_rows_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path(
+        "data/reports/color_card_production_20260623_final/"
+        "color_card_unpublished_failure_rows.csv"
+    ),
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260622/classification_manifest.csv"),
+    catalog_path: Annotated[Path | None, typer.Option()] = None,
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    max_rows: Annotated[int | None, typer.Option()] = None,
+) -> None:
+    active_catalog_path = catalog_path or Path(settings.color_card_catalog_path)
+    active_output_dir = output_dir or (
+        Path("data/production_runs")
+        / datetime.now(UTC).strftime("color_card_recovery_%Y%m%dT%H%M%SZ")
+    )
+    result = ColorCardProductionService(
+        classification_path=classification_path,
+        catalog_path=active_catalog_path,
+    ).plan_recovery(
+        original_plan_path=original_plan_path,
+        failure_rows_path=failure_rows_path,
+        output_dir=active_output_dir,
+        max_rows=max_rows,
+    )
+    typer.echo(
+        "Color-card recovery plan complete: "
+        f"total_plan_rows={result.total_plan_rows}"
+    )
+    typer.echo(
+        "Color-card recovery artifacts exported: "
+        f"recovery_plan={result.production_plan_path} "
+        f"generation_requests={result.generation_requests_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path}"
+    )
+
+
+@app.command("run-color-card-production")
+def run_color_card_production(
+    plan_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/production_runs/color_card_production_20260622/production_plan.csv"),
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260622/classification_manifest.csv"),
+    catalog_path: Annotated[Path | None, typer.Option()] = None,
+    max_jobs: Annotated[int | None, typer.Option()] = None,
+    generated_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/generated/color_card_production_20260622"),
+    published_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/published"),
+    log_path: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    ensure_database()
+    active_catalog_path = catalog_path or Path(settings.color_card_catalog_path)
+    active_log_path = log_path or (
+        Path(settings.pipeline_log_dir)
+        / datetime.now(UTC).strftime("color_card_production_%Y%m%dT%H%M%SZ.jsonl")
+    )
+    adapter = build_image_generation_adapter(output_dir=generated_dir)
+    with SessionLocal() as db:
+        result = ColorCardProductionService(
+            classification_path=classification_path,
+            catalog_path=active_catalog_path,
+        ).execute_plan(
+            db=db,
+            plan_path=plan_path,
+            max_jobs=max_jobs,
+            generated_dir=generated_dir,
+            published_dir=published_dir,
+            log_path=active_log_path,
+            adapter=adapter,
+        )
+    typer.echo(
+        "Color-card production run complete: "
+        f"attempted={result.attempted} "
+        f"generated={result.generated} "
+        f"qa_passed={result.qa_passed} "
+        f"published={result.published} "
+        f"failed={result.failed}"
+    )
+    typer.echo(f"Color-card production log: {result.log_path}")
 
 
 @app.command("detect-ai-watermarks")

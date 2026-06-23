@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.adapters.openai_multimodal import OpenAIMultimodalClient
 from app.core.config import settings
 from app.core.ids import stable_id
+from app.core.product_specs import ROLL_CORE_PAPER_TUBE_REVISION, ROLL_CORE_PAPER_TUBE_SPEC
 from app.core.states import GeneratedOutputStatus, QAReportDecision, VisualUnitStatus
 from app.models import GeneratedOutput, QAReport, VisualUnit
 from app.services.color_material_qa_service import LocalColorMaterialQAService
@@ -98,6 +99,9 @@ class OpenAIQAEvaluator:
             "system: transparent PET top layer, optical depth, gloss or matte behavior, metallic "
             "flake or pearl/chameleon effects when specified, and reflections following curved "
             "vehicle panels. A flat paint-like surface is a material-realism failure. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC} Treat plastic roll cores, metal sleeves, solid centers, "
+            "foam cores, acrylic tubes, glossy colored cores, and thin sticker-like rings as "
+            "product-accuracy/material-realism failures whenever a roll core is visible. "
             "Any automaker badge, grille emblem, wheel center-cap logo, watermark, readable text, "
             "license plate, QR code, barcode, fake certification, or unsupported claim still "
             "visible in the output is a medium or high severity failure and cannot be published. "
@@ -291,6 +295,7 @@ class QAService:
             result = provider_error_qa(exc, self.evaluator.version)
         result = self._with_local_color_material_qa(result, output)
         result = self._with_product_fact_guardrails(result, output)
+        result = self._with_roll_core_guardrails(result)
         result = self._with_layout_only_visual_guardrails(result, output)
         result = self._with_structure_preservation_guardrails(result, output)
         result = self._with_photorealism_guardrails(result)
@@ -466,6 +471,57 @@ class QAService:
                 "status": "failed",
                 "source_item_code": primary_code,
                 "matched_color_card_item": item_no,
+            },
+        }
+
+    def _with_roll_core_guardrails(self, result: dict[str, object]) -> dict[str, object]:
+        issue_text = _wrong_roll_core_issue_text(result)
+        if not issue_text:
+            return result
+
+        failures = list(cast(list[dict[str, object]], result["failures"]))
+        if not any(
+            str(failure.get("rule_id", "")) == "roll_core_paper_tube_required"
+            for failure in failures
+        ):
+            failures.append(
+                _normalize_failure(
+                    {
+                        "type": "product_accuracy",
+                        "severity": "high",
+                        "issue": (
+                            "Visible roll core does not match the required reinforced "
+                            "cardboard paper tube construction."
+                        ),
+                        "evidence": issue_text[:600],
+                        "rule_id": "roll_core_paper_tube_required",
+                    }
+                )
+            )
+
+        revision_instruction_value = result.get("revision_instruction")
+        if revision_instruction_value:
+            revision_instruction = str(revision_instruction_value)
+            if ROLL_CORE_PAPER_TUBE_REVISION not in revision_instruction:
+                revision_instruction = f"{revision_instruction} {ROLL_CORE_PAPER_TUBE_REVISION}"
+        else:
+            revision_instruction = ROLL_CORE_PAPER_TUBE_REVISION
+
+        return {
+            **result,
+            "product_accuracy_score": min(
+                _score(result.get("product_accuracy_score"), 10, 20),
+                15,
+            ),
+            "material_realism_score": min(
+                _score(result.get("material_realism_score"), 10, 20),
+                15,
+            ),
+            "failures": failures,
+            "revision_instruction": revision_instruction,
+            "roll_core_guardrail": {
+                "status": "failed",
+                "required_spec": ROLL_CORE_PAPER_TUBE_SPEC,
             },
         }
 
@@ -792,6 +848,65 @@ def _blank_and_edge_ratios(image: Image.Image) -> tuple[float, float]:
     edge_pixels = sum(1 for value in edges.tobytes() if value > 24)
     total = len(pixel_bytes) // 3
     return blank_pixels / total, edge_pixels / total
+
+
+def _wrong_roll_core_issue_text(result: dict[str, object]) -> str:
+    chunks: list[str] = []
+    failures = result.get("failures", [])
+    if isinstance(failures, list):
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            chunks.extend(
+                str(failure.get(key, ""))
+                for key in ("type", "rule_id", "issue", "evidence")
+            )
+    revision_instruction = result.get("revision_instruction")
+    if revision_instruction:
+        chunks.append(str(revision_instruction))
+
+    text = " ".join(chunks).lower()
+    if not text:
+        return ""
+    core_context_terms = (
+        "roll core",
+        "tube core",
+        "paper core",
+        "core material",
+        "roll end",
+        "cut end",
+        "cut-end",
+        "cross-section",
+        "cross section",
+    )
+    if not any(term in text for term in core_context_terms):
+        return ""
+    wrong_terms = (
+        "plastic core",
+        "plastic tube",
+        "plastic/metal",
+        "metal core",
+        "metal sleeve",
+        "solid center",
+        "solid core",
+        "foam core",
+        "acrylic core",
+        "acrylic tube",
+        "vinyl core",
+        "colored core",
+        "glossy core",
+        "glossy plastic",
+        "sticker-like ring",
+        "wrong roll core",
+        "incorrect roll core",
+        "instead of a paper tube",
+        "instead of paper tube",
+        "not a paper tube",
+        "not paper tube",
+    )
+    if any(term in text for term in wrong_terms):
+        return text
+    return ""
 
 
 def _normalize_failure(failure: dict[str, object]) -> dict[str, object]:

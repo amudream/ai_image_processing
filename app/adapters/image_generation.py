@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
@@ -267,7 +269,7 @@ class OpenAIImageGenerationAdapter:
                 last_error = exc
                 if attempt >= max_retries or not self._is_retryable(exc):
                     raise
-                time.sleep(min(2**attempt, 8))
+                time.sleep(self._retry_delay_seconds(exc, attempt))
         raise RuntimeError("OpenAI image generation request failed") from last_error
 
     def _post_edit_with_retries(
@@ -284,7 +286,7 @@ class OpenAIImageGenerationAdapter:
                 last_error = exc
                 if attempt >= max_retries or not self._is_retryable(exc):
                     raise
-                time.sleep(min(2**attempt, 8))
+                time.sleep(self._retry_delay_seconds(exc, attempt))
         raise RuntimeError("OpenAI image edit request failed") from last_error
 
     def _post_edit_once(
@@ -406,6 +408,32 @@ class OpenAIImageGenerationAdapter:
                 httpx.RemoteProtocolError,
             ),
         )
+
+    def _retry_delay_seconds(self, exc: Exception, attempt: int) -> float:
+        retry_after = self._retry_after_seconds(exc)
+        max_delay = max(0.0, float(settings.openai_retry_max_delay_seconds))
+        if retry_after is not None:
+            return float(min(max(0.0, retry_after), max_delay))
+        initial_delay = max(0.0, float(settings.openai_retry_initial_delay_seconds))
+        return float(min(initial_delay * (2 ** (attempt - 1)), max_delay))
+
+    def _retry_after_seconds(self, exc: Exception) -> float | None:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return None
+        value = exc.response.headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return float((retry_at - datetime.now(UTC)).total_seconds())
 
     def _prompt_for_image_model(self, job: GenerationJob) -> str:
         prompt = str(job.request_json["prompt"])

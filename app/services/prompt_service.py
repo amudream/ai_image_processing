@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.ids import stable_id
+from app.core.product_specs import ROLL_CORE_PAPER_TUBE_SPEC
 from app.core.states import VisualUnitStatus
 from app.models import PromptRecord, VisualBrief, VisualUnit
 
@@ -50,6 +51,7 @@ class PromptCompilerService:
             "Make the automotive film read as an installed product, not ordinary paint: show "
             "material-specific reflection behavior, panel-continuity, subtle film sheen, and "
             "plausible wrap/tint/protection-film cues without adding text labels. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC} "
             "Preserve the exact film_type, color_family, and finish facts from the brief. "
             f"Composition: {creative['composition']}. Background: {creative['background']}. "
             f"Lighting: {creative['lighting']}. Must show: {', '.join(creative['must_show'])}. "
@@ -105,7 +107,8 @@ class PromptCompilerService:
             "Use generic/private-label packaging surfaces with clean design blocks but no "
             "readable text. If product copy is needed later, it will be added by a deterministic "
             "template, not by the image model. Keep boxes, film rolls, film tubes, and material "
-            "samples physically plausible and commercially polished."
+            "samples physically plausible and commercially polished. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC}"
         )
         negative = (
             "CARLAS, XPPF, source logo, copied source text, copied label, copied collage layout, "
@@ -160,6 +163,7 @@ class PromptCompilerService:
             "not an empty bordered rectangle, no empty card grid, no stack of placeholder boxes, "
             "and fill remaining areas with film rolls, swatches, material close-ups, layer "
             "details, or cropped vehicle-panel views. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC} "
             "For vehicle panels, prefer anonymous cropped side/quarter body surfaces and material "
             "closeups; avoid full front/rear fascia, recognizable grille designs, brand-specific "
             "headlights or taillights, no visible wheels or tires, wheel arches, detailed wheel "
@@ -225,6 +229,7 @@ class PromptCompilerService:
             "restrained material-textured copy-safe area, not an empty bordered rectangle, no "
             "empty card grid, no stack of placeholder boxes, and fill remaining areas with film "
             "rolls, swatches, material close-ups, layer details, or cropped vehicle-panel views. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC} "
             "For vehicle panels, prefer anonymous cropped side/quarter body surfaces and "
             "material closeups; avoid full front/rear fascia, recognizable grille designs, "
             "brand-specific headlights or taillights, no visible wheels or tires, wheel arches, "
@@ -283,6 +288,7 @@ class PromptCompilerService:
             "information was removed. "
             "Keep the source image recognizable as the same photo. "
             "Preserve the exact film_type, color_family, and finish facts from the brief. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC} "
             f"Composition: {creative['composition']}. "
             f"Must show: {', '.join(creative['must_show'])}. "
             "No added text, no added logos, no invented product labels."

@@ -5,19 +5,24 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+import httpx
 import pytest
 from PIL import Image, ImageChops, ImageDraw, ImageStat
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.adapters.image_generation import MockImageGenerationAdapter, OpenAIImageGenerationAdapter
+from app.adapters.openai_multimodal import OpenAIMultimodalClient
 from app.core.config import settings
 from app.core.states import QAReportDecision
+from app.db.base import Base
 from app.models import (
     GeneratedOutput,
     GenerationJob,
     ImageAnalysis,
     ImageAsset,
     JobStageRun,
+    PromptRecord,
     PublishedAsset,
     QAReport,
     VisualUnit,
@@ -455,6 +460,251 @@ def test_visual_unit_can_be_produced_and_published(tmp_path: Path, db_session: S
     assert db_session.query(GenerationJob).count() == 1
     assert db_session.query(GeneratedOutput).count() == 1
     assert db_session.query(PublishedAsset).count() == 1
+
+
+def test_qa_blocks_wrong_roll_core_material_even_with_high_scores(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class PlasticCoreEvaluator:
+        version = "plastic_core_detector"
+
+        def evaluate(self, _output: object, _unit: object) -> dict[str, object]:
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 20,
+                "structure_preservation_score": 20,
+                "failures": [
+                    {
+                        "type": "material_realism",
+                        "severity": "low",
+                        "issue": (
+                            "The visible roll core is a glossy plastic/metal sleeve with a solid "
+                            "center instead of a paper tube."
+                        ),
+                        "evidence": "Wrong roll core material visible in the cross-section.",
+                        "rule_id": "wrong_roll_core_material",
+                    }
+                ],
+                "revision_instruction": None,
+                "evaluator": self.version,
+            }
+
+    image_path = tmp_path / "wrong_roll_core.png"
+    make_image(image_path)
+    unit = VisualUnit(
+        id="vu_wrong_roll_core",
+        sku="CO-WHITE-GLOS",
+        film_type="color_wrap",
+        color_family="white",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_wrong_roll_core",
+        visual_brief_id="brief_wrong_roll_core",
+        prompt_text="Create a catalog product hero with film rolls.",
+        negative_prompt_text="No logos.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_wrong_roll_core",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text},
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_wrong_roll_core",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_wrong_roll_core",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(image_path),
+        width=640,
+        height=480,
+        status="qa_pending",
+    )
+    db_session.add_all([unit, prompt, job, output])
+    db_session.flush()
+
+    report = QAService(db_session, evaluator=PlasticCoreEvaluator()).evaluate(output)
+
+    assert report.decision == "revise"
+    assert not can_publish(report)
+    roll_core_failure = next(
+        failure
+        for failure in report.failures_json
+        if failure["rule_id"] == "roll_core_paper_tube_required"
+    )
+    assert roll_core_failure["severity"] == "high"
+    assert report.product_accuracy_score <= 15
+    assert report.material_realism_score <= 15
+    assert report.revision_instruction is not None
+    assert "thick reinforced cardboard paper tube core" in report.revision_instruction
+    assert "white inner wall" in report.revision_instruction
+    assert "cream beige paper edge" in report.revision_instruction
+
+
+def test_generation_enqueue_requeues_failed_job_without_output(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class FailingImageGenerationAdapter:
+        def generate(self, _job: GenerationJob) -> dict[str, object]:
+            raise httpx.ReadTimeout("temporary provider failure")
+
+    image_path = tmp_path / "color_wrap_grey_satin_installed.png"
+    make_image(image_path)
+    IngestionService(db_session).import_folder(tmp_path)
+    AnalysisService(db_session, analyst=MockImageAnalyst()).analyze_pending()
+    unit = VisualUnitService(db_session).build_from_analyses()[0]
+    brief = VisualDirectorService(db_session).create_brief(unit)
+    prompt = PromptCompilerService(db_session).compile_prompt(brief)
+
+    failing_generator = GenerationService(db_session, adapter=FailingImageGenerationAdapter())
+    failed_job = failing_generator.enqueue(prompt)
+    with pytest.raises(httpx.ReadTimeout):
+        failing_generator.run(failed_job)
+    failed_job.max_attempts = 1
+    prompt.retry_policy_json = {"max_attempts": 3, "retryable": True}
+    db_session.add_all([failed_job, prompt])
+    db_session.flush()
+
+    resumed_job = GenerationService(
+        db_session,
+        adapter=MockImageGenerationAdapter(output_dir=tmp_path / "generated"),
+    ).enqueue(prompt)
+    output = GenerationService(
+        db_session,
+        adapter=MockImageGenerationAdapter(output_dir=tmp_path / "generated"),
+    ).run(resumed_job)
+
+    assert resumed_job.id == failed_job.id
+    assert resumed_job.status == "succeeded"
+    assert resumed_job.attempt == 2
+    assert output.generation_job_id == failed_job.id
+
+
+def test_generation_run_commits_running_state_before_external_call(tmp_path: Path) -> None:
+    db_path = tmp_path / "factory.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    observed: dict[str, object] = {}
+
+    class ObservingImageGenerationAdapter:
+        def generate(self, job: GenerationJob) -> dict[str, object]:
+            with session_factory() as observer_session:
+                observed_job = observer_session.get(GenerationJob, job.id)
+                observed_unit = observer_session.get(VisualUnit, job.visual_unit_id)
+                observed["job_status"] = observed_job.status if observed_job else None
+                observed["unit_status"] = observed_unit.status if observed_unit else None
+
+            output_path = tmp_path / "generated" / "observed.png"
+            make_image(output_path, color=(140, 140, 140))
+            return {
+                "output_id": "out_observed_external_call",
+                "image_uri": str(output_path),
+                "width": 1024,
+                "height": 1024,
+            }
+
+    with session_factory() as session:
+        image_path = tmp_path / "color_wrap_grey_satin_installed.png"
+        make_image(image_path)
+        IngestionService(session).import_folder(tmp_path)
+        AnalysisService(session, analyst=MockImageAnalyst()).analyze_pending()
+        unit = VisualUnitService(session).build_from_analyses()[0]
+        brief = VisualDirectorService(session).create_brief(unit)
+        prompt = PromptCompilerService(session).compile_prompt(brief)
+
+        generator = GenerationService(session, adapter=ObservingImageGenerationAdapter())
+        job = generator.enqueue(prompt)
+        output = generator.run(job)
+
+    with session_factory() as observer_session:
+        persisted_job = observer_session.get(GenerationJob, job.id)
+        persisted_output = observer_session.get(GeneratedOutput, output.id)
+
+    assert observed == {"job_status": "running", "unit_status": "generating"}
+    assert persisted_job is not None
+    assert persisted_job.status == "succeeded"
+    assert persisted_output is not None
+    assert persisted_output.status == "qa_pending"
+
+
+def test_generation_run_rejects_already_running_job_without_external_call(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class RaisingAdapter:
+        def generate(self, _job: GenerationJob) -> dict[str, object]:
+            raise AssertionError("running jobs must not start another external call")
+
+    image_path = tmp_path / "color_wrap_grey_satin_installed.png"
+    make_image(image_path)
+    IngestionService(db_session).import_folder(tmp_path)
+    AnalysisService(db_session, analyst=MockImageAnalyst()).analyze_pending()
+    unit = VisualUnitService(db_session).build_from_analyses()[0]
+    brief = VisualDirectorService(db_session).create_brief(unit)
+    prompt = PromptCompilerService(db_session).compile_prompt(brief)
+    generator = GenerationService(db_session, adapter=RaisingAdapter())
+    job = generator.enqueue(prompt)
+    job.status = "running"
+    unit.status = "generating"
+    db_session.add_all([job, unit])
+    db_session.commit()
+
+    with pytest.raises(RuntimeError, match="already running"):
+        generator.run(job)
+
+    persisted_job = db_session.get(GenerationJob, job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "running"
+    assert db_session.query(GeneratedOutput).count() == 0
+
+
+def test_generation_run_rejects_failed_job_without_external_call(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class RaisingAdapter:
+        def generate(self, _job: GenerationJob) -> dict[str, object]:
+            raise AssertionError("failed jobs must be requeued before running")
+
+    image_path = tmp_path / "color_wrap_grey_satin_installed.png"
+    make_image(image_path)
+    IngestionService(db_session).import_folder(tmp_path)
+    AnalysisService(db_session, analyst=MockImageAnalyst()).analyze_pending()
+    unit = VisualUnitService(db_session).build_from_analyses()[0]
+    brief = VisualDirectorService(db_session).create_brief(unit)
+    prompt = PromptCompilerService(db_session).compile_prompt(brief)
+    generator = GenerationService(db_session, adapter=RaisingAdapter())
+    job = generator.enqueue(prompt)
+    job.status = "failed"
+    job.error_message = "previous provider failure"
+    db_session.add(job)
+    db_session.commit()
+
+    with pytest.raises(RuntimeError, match="must be queued"):
+        generator.run(job)
+
+    persisted_job = db_session.get(GenerationJob, job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "failed"
+    assert db_session.query(GeneratedOutput).count() == 0
 
 
 def test_prompt_compiler_defaults_to_safe_material_crop(
@@ -1274,6 +1524,12 @@ def test_packaging_rebuild_uses_source_for_facts_but_generates_new_image(
     assert unit.metadata_json["publish_prefix"] == "PKG"
     assert brief.route == "packaging_rebuild"
     assert "Create a new realistic ecommerce packaging" in prompt.prompt_text
+    assert "thick reinforced cardboard paper tube core" in prompt.prompt_text
+    assert "white inner wall" in prompt.prompt_text
+    assert "cream beige paper edge" in prompt.prompt_text
+    assert "hollow cylindrical roll core" in prompt.prompt_text
+    assert "3-inch paper core" in prompt.prompt_text
+    assert "visible cross-section" in prompt.prompt_text
     assert job.request_json["generation_mode"] == "packaging_rebuild"
     assert job.request_json["source_asset_id"] == asset.id
     assert OpenAIImageGenerationAdapter(api_key="test")._source_image_path(job) is None
@@ -1389,6 +1645,71 @@ def test_openai_image_adapter_normalizes_ecommerce_canvas(
 
 def test_ecommerce_image_fit_defaults_to_cover_for_filled_square_canvas() -> None:
     assert settings.ecommerce_image_fit == "cover"
+
+
+def test_openai_image_generation_retry_uses_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = [
+                httpx.Response(
+                    429,
+                    headers={"Retry-After": "17"},
+                    request=httpx.Request("POST", "https://example.test/images/generations"),
+                ),
+                httpx.Response(
+                    200,
+                    json={"data": [{"b64_json": "ignored"}]},
+                    request=httpx.Request("POST", "https://example.test/images/generations"),
+                ),
+            ]
+
+        def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
+            return self.responses.pop(0)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.adapters.image_generation.time.sleep", sleeps.append)
+
+    adapter = OpenAIImageGenerationAdapter(base_url="https://example.test", api_key="test")
+    response = adapter._post_generation_with_retries(
+        cast(httpx.Client, FakeClient()), {"model": "gpt-image-2"}
+    )
+
+    assert response.status_code == 200
+    assert sleeps == [17.0]
+
+
+def test_openai_multimodal_retry_uses_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RetryAfterClient(OpenAIMultimodalClient):
+        def __init__(self) -> None:
+            super().__init__(base_url="https://example.test", api_key="test", model="gpt-test")
+            self.attempts = 0
+
+        def _post_chat_once(self, _payload: dict[str, object]) -> dict[str, object]:
+            self.attempts += 1
+            if self.attempts == 1:
+                response = httpx.Response(
+                    503,
+                    headers={"Retry-After": "19"},
+                    request=httpx.Request("POST", "https://example.test/chat/completions"),
+                )
+                raise httpx.HTTPStatusError(
+                    "temporary unavailable",
+                    request=response.request,
+                    response=response,
+                )
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.adapters.openai_multimodal.time.sleep", sleeps.append)
+
+    body = RetryAfterClient()._post_chat({"model": "gpt-test"})
+
+    assert body["choices"][0]["message"]["content"] == "{}"
+    assert sleeps == [19.0]
 
 
 def test_openai_image_adapter_builds_transparent_mask_from_risk_regions(tmp_path: Path) -> None:
@@ -1878,6 +2199,206 @@ def test_retry_plan_uses_failure_axis_specific_strategy() -> None:
     assert person["publish_blocking"] is True
     person_changes = cast(list[dict[str, object]], person["changes"])
     assert "Do not retry" in str(person_changes[0]["instruction"])
+
+
+def test_retry_plan_does_not_treat_surface_material_text_as_human_subject() -> None:
+    plan = RetryPlannerService(db=None).plan_retry(  # type: ignore[arg-type]
+        retry_report_for_failure(
+            {
+                "type": "product_accuracy",
+                "severity": "medium",
+                "issue": "Material surface includes unsupported metallic speckling.",
+                "evidence": (
+                    "The purple surface should be medium gloss vinyl with no pearl effect."
+                ),
+                "rule_id": "exact_color_card_material_profile_enforcement",
+            }
+        )
+    )
+
+    axes = cast(list[str], plan["failure_axes"])
+    assert "catalog_color_material" in axes
+    assert "human_subject" not in axes
+    assert plan["retry_strategy"] == "catalog_color_material_retry"
+
+
+def test_catalog_product_hero_retry_instruction_targets_thin_flexible_material(
+    db_session: Session,
+) -> None:
+    unit = VisualUnit(
+        id="vu_catalog_hero_retry",
+        sku="CO-ORAN-GLOS",
+        film_type="color_wrap",
+        color_family="orange",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_catalog_hero_retry",
+        visual_brief_id="brief_catalog_hero_retry",
+        prompt_text="Create a catalog product hero.",
+        negative_prompt_text="No text.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_catalog_hero_retry",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text},
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_catalog_hero_retry",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_catalog_hero_retry",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri="unused.png",
+        width=1024,
+        height=1024,
+        status="qa_fail",
+    )
+    report = QAReport(
+        id="qa_catalog_hero_retry",
+        output_id=output.id,
+        total_score=91,
+        decision="revise",
+        risk_score=20,
+        product_accuracy_score=18,
+        material_realism_score=16,
+        vehicle_integrity_score=15,
+        composition_score=9,
+        commercial_readiness_score=13,
+        failures_json=[
+            {
+                "type": "material_realism",
+                "severity": "medium",
+                "issue": "Sample cards read too rigid and thick for 7mil PET/vinyl film.",
+                "rule_id": "thin_flexible_pet_vinyl_required",
+            }
+        ],
+        revision_instruction="Make the sheets/cards visibly thinner and more flexible.",
+    )
+    db_session.add_all([unit, prompt, job, output, report])
+    db_session.flush()
+
+    retry_job = RetryPlannerService(db_session).create_retry_job(job, report)
+
+    assert retry_job is not None
+    instruction = str(retry_job.request_json["revision_instruction"])
+    assert "catalog product hero mode" in instruction
+    assert "paper-thin" in instruction
+    assert "rigid acrylic" in instruction
+    assert "thick reinforced cardboard paper tube core" in instruction
+    assert "white inner wall" in instruction
+    assert "cream beige paper edge" in instruction
+    assert "hollow cylindrical roll core" in instruction
+    assert "3-inch paper core" in instruction
+    assert "visible cross-section" in instruction
+    assert "Do not switch to a vehicle" in instruction
+
+
+def test_retry_planner_requeues_existing_failed_retry_job_without_output(
+    db_session: Session,
+) -> None:
+    unit = VisualUnit(
+        id="vu_retry_requeue",
+        sku="CO-RED-GLOS",
+        film_type="color_wrap",
+        color_family="red",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="retry_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_retry_requeue",
+        visual_brief_id="brief_retry_requeue",
+        prompt_text="Render thin flexible red vinyl film rolls.",
+        negative_prompt_text="No logos.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_retry_requeue",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text},
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_retry_requeue",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_retry_requeue",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri="unused.png",
+        width=1024,
+        height=1024,
+        status="qa_fail",
+    )
+    report = QAReport(
+        id="qa_retry_requeue",
+        output_id=output.id,
+        total_score=72,
+        decision="revise",
+        risk_score=20,
+        product_accuracy_score=16,
+        material_realism_score=11,
+        vehicle_integrity_score=15,
+        composition_score=4,
+        commercial_readiness_score=6,
+        failures_json=[
+            {
+                "type": "material_realism",
+                "severity": "medium",
+                "issue": "Output looks too rigid.",
+                "rule_id": "thin_flexible_pet_vinyl_required",
+            }
+        ],
+        revision_instruction="Make the film visibly thinner.",
+    )
+    retry_job = GenerationJob(
+        id="job_retry_requeue_retry2",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text, "revision_instruction": "old"},
+        status="failed",
+        attempt=2,
+        max_attempts=7,
+        parent_job_id=job.id,
+        root_job_id=job.id,
+        priority=30,
+        error_message="temporary provider failure",
+    )
+    db_session.add_all([unit, prompt, job, output, report, retry_job])
+    db_session.flush()
+
+    planned = RetryPlannerService(db_session).create_retry_job(job, report)
+
+    assert planned is retry_job
+    assert planned.status == "queued"
+    assert planned.error_message is None
+    assert planned.available_at is not None
 
 
 def test_qa_failure_overrides_high_score() -> None:

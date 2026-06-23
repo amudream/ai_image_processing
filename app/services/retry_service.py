@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from typing import cast
 
 from sqlalchemy.orm import Session
 
 from app.core.ids import stable_id
-from app.models import GenerationJob, PromptRecord, QAReport
+from app.core.product_specs import ROLL_CORE_PAPER_TUBE_REVISION, ROLL_CORE_PAPER_TUBE_SPEC
+from app.models import GeneratedOutput, GenerationJob, PromptRecord, QAReport
 
 
 class RetryPlannerService:
@@ -63,15 +65,33 @@ class RetryPlannerService:
         if failed_job.attempt >= max_attempts or not revision_instruction:
             return None
         retry_id = f"{failed_job.id}_retry{failed_job.attempt + 1}"
-        existing = self.db.get(GenerationJob, retry_id)
-        if existing is not None:
-            return existing
-
         request_json = {
             **failed_job.request_json,
             "revision_instruction": self._compile_revision_instruction(report, plan),
             "retry_plan": plan,
         }
+        existing = self.db.get(GenerationJob, retry_id)
+        if existing is not None:
+            existing_output = self.db.query(GeneratedOutput.id).filter_by(
+                generation_job_id=existing.id
+            ).one_or_none()
+            if (
+                existing.status == "failed"
+                and existing_output is None
+                and existing.attempt < existing.max_attempts
+            ):
+                existing.request_json = request_json
+                existing.request_fingerprint = stable_id(
+                    "request", json.dumps(request_json, sort_keys=True, ensure_ascii=False)
+                )
+                existing.error_message = None
+                existing.available_at = datetime.now(UTC)
+                existing.priority = failed_job.priority
+                existing.status = "queued"
+                self.db.add(existing)
+                self.db.flush()
+            return existing
+
         retry = GenerationJob(
             id=retry_id,
             prompt_id=failed_job.prompt_id,
@@ -117,6 +137,7 @@ class RetryPlannerService:
                 "Stay in source-image edit mode. Preserve the original photo, crop, camera angle, "
                 "vehicle geometry, film color, finish, reflections, and lighting. Only fix the "
                 "reported QA issue by locally removing risky information or retouching artifacts. "
+                f"{ROLL_CORE_PAPER_TUBE_REVISION} "
                 "Do not invent a new car, new angle, new background, or new product color."
             )
         if job is not None and job.route == "structure_preserve_rebuild":
@@ -146,8 +167,27 @@ class RetryPlannerService:
                 "needed, make it material-textured rather than an empty bordered rectangle. Fill "
                 "all other areas with product/material visuals, especially the right side. Do not "
                 "create empty card grids or collapse a multi-panel source into one generic car "
-                "render. Vehicle panels must be anonymous body/glass/material crops with no "
+                f"render. {ROLL_CORE_PAPER_TUBE_REVISION} Vehicle panels must be anonymous "
+                "body/glass/material crops with no "
                 "visible wheels, tires, wheel arches, or center caps."
+            )
+        if job is not None and job.route == "catalog_product_hero":
+            return (
+                f"{base}\n"
+                f"Failed QA types: {failed_types}.\n"
+                f"{axis_context}"
+                "Stay in catalog product hero mode with no vehicle body, no glass, no grille, "
+                "no wheels, no lights, and no readable text. Render only freestanding wrap-film "
+                "products: rolls, curled sheets, loose swatch leaves, and flexible sample strips. "
+                "Make every exposed edge paper-thin and visibly flexible like 7mil PET/vinyl: "
+                "slight curl memory, tiny edge waviness, small handling marks, dust specks, and "
+                "subtle imperfect cuts. Do not render rigid acrylic slabs, thick plastic cards, "
+                "rounded solid plates, or stiff molded panels. Lock the catalog color and finish "
+                "across every roll, sheet, and sample. "
+                f"{ROLL_CORE_PAPER_TUBE_SPEC} "
+                f"{ROLL_CORE_PAPER_TUBE_REVISION} "
+                "Do not switch to a vehicle scene or a "
+                "surface crop."
             )
         return (
             f"{base}\n"
@@ -157,8 +197,8 @@ class RetryPlannerService:
             "surfaces such as door, fender, hood, glass, panel gap, or film edge. Avoid complete "
             "vehicle views, front or rear fascia, grille, wheels, wheel center caps, production "
             "model silhouettes, and brand-like lights unless the product is explicitly headlight "
-            "film. Preserve exact film_type/color_family/finish facts. Do not add text, logos, "
-            "plates, QR codes, or claims."
+            "film. Preserve exact film_type/color_family/finish facts. "
+            f"{ROLL_CORE_PAPER_TUBE_REVISION} Do not add text, logos, plates, QR codes, or claims."
         )
 
     def _revision_instruction(self, report: QAReport) -> str | None:
@@ -219,17 +259,7 @@ class RetryPlannerService:
     def _failure_axes(self, report: QAReport) -> list[str]:
         axes: list[str] = []
         blob = self._failure_blob(report)
-        if any(
-            term in blob
-            for term in (
-                "person",
-                "human",
-                "face",
-                "model",
-                "hands dominate",
-                "human_subject",
-            )
-        ):
+        if self._has_human_subject_axis(blob):
             axes.append("human_subject")
         if any(
             term in blob
@@ -297,6 +327,21 @@ class RetryPlannerService:
             )
             for failure in report.failures_json
         ).lower()
+
+    def _has_human_subject_axis(self, blob: str) -> bool:
+        if any(
+            phrase in blob
+            for phrase in (
+                "human_subject",
+                "human subject",
+                "person_detected",
+                "person detected",
+                "human model",
+                "hands dominate",
+            )
+        ):
+            return True
+        return re.search(r"\b(person|people|human|face|hands?)\b", blob) is not None
 
     def _retry_strategy(self, failure_axes: list[str], retry_type: str) -> str:
         if "human_subject" in failure_axes:

@@ -55,6 +55,31 @@ class GenerationService:
         )
         existing = self.db.get(GenerationJob, job_id)
         if existing is not None:
+            prompt_max_attempts = int(prompt.retry_policy_json.get("max_attempts", 3))
+            if prompt_max_attempts > existing.max_attempts:
+                existing.max_attempts = prompt_max_attempts
+            if self._can_requeue_failed_job(existing):
+                previous_errors = existing.request_json.get("previous_error_messages", [])
+                if not isinstance(previous_errors, list):
+                    previous_errors = []
+                if existing.error_message:
+                    previous_errors.append(
+                        {
+                            "attempt": existing.attempt,
+                            "error_message": existing.error_message,
+                            "recorded_at": datetime.now(UTC).isoformat(),
+                        }
+                    )
+                existing.request_json = {
+                    **existing.request_json,
+                    "previous_error_messages": previous_errors,
+                }
+                existing.error_message = None
+                existing.attempt += 1
+                existing.available_at = datetime.now(UTC)
+                existing.priority = priority
+                self.transition(existing, GenerationJobStatus.QUEUED)
+                self.db.flush()
             return existing
 
         risk_regions: list[object] = []
@@ -158,6 +183,14 @@ class GenerationService:
         self.db.flush()
         return job
 
+    def _can_requeue_failed_job(self, job: GenerationJob) -> bool:
+        if job.status != GenerationJobStatus.FAILED.value:
+            return False
+        existing_output = self.db.scalar(
+            select(GeneratedOutput.id).where(GeneratedOutput.generation_job_id == job.id)
+        )
+        return existing_output is None and job.attempt < job.max_attempts
+
     def _has_explicit_product_item_code(self, product_facts: dict[str, object]) -> bool:
         primary = product_facts.get("primary_item_code")
         if isinstance(primary, str) and primary.strip():
@@ -225,6 +258,15 @@ class GenerationService:
         existing = self.db.query(GeneratedOutput).filter_by(generation_job_id=job.id).one_or_none()
         if existing is not None:
             return existing
+        if job.status == GenerationJobStatus.RUNNING.value:
+            raise RuntimeError(
+                f"Generation job {job.id} is already running; "
+                "refusing duplicate external image call"
+            )
+        if job.status != GenerationJobStatus.QUEUED.value:
+            raise RuntimeError(
+                f"Generation job {job.id} must be queued before run; current status={job.status}"
+            )
 
         try:
             self.transition(job, GenerationJobStatus.RUNNING)
@@ -232,6 +274,8 @@ class GenerationService:
             if unit is not None:
                 unit.status = VisualUnitStatus.GENERATING.value
                 self.db.add(unit)
+            self.db.flush()
+            self.db.commit()
             result = self.adapter.generate(job)
             output = GeneratedOutput(
                 id=str(result["output_id"]),
@@ -248,9 +292,11 @@ class GenerationService:
                 self.db.add(unit)
             self.db.add(output)
             self.db.flush()
+            self.db.commit()
             return output
         except Exception as exc:
             job.error_message = str(exc)
             self.transition(job, GenerationJobStatus.FAILED)
             self.db.flush()
+            self.db.commit()
             raise

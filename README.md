@@ -62,6 +62,11 @@ python -m app.cli run-production-queue-batch ./data/raw --limit 20 --max-tasks 2
 python -m app.cli run-production-worker --stage generation --max-tasks 20 --report-dir ./data/reports/queue_demo
 python -m app.cli export-published ./data/published
 python -m app.cli classify-source-library --output-dir ./data/reports/source_classification_demo
+python -m app.cli plan-color-card-production --output-dir ./data/production_runs/color_card_demo
+python -m app.cli plan-color-card-recovery --output-dir ./data/production_runs/color_card_recovery_demo
+python -m app.cli run-color-card-production --plan-path ./data/production_runs/color_card_demo/production_plan.csv
+python -m app.cli run-acceptance-loop --report-dir ./data/reports/acceptance_loop_demo --dry-run
+python -m app.cli export-report ./data/reports/color_card_demo
 python -m app.cli detect-ai-watermarks --provider remove_ai_watermarks --report-dir ./data/reports/ai_watermark_demo
 ```
 
@@ -135,7 +140,11 @@ STAGE_MAX_INFLIGHT_ANALYSIS=2
 STAGE_MAX_INFLIGHT_GENERATION=50
 STAGE_MAX_INFLIGHT_QA=2
 STAGE_MAX_INFLIGHT_PUBLISH=4
-OPENAI_MAX_RETRIES=3
+SQLITE_BUSY_TIMEOUT_MS=120000
+SQLITE_WAL_ENABLED=true
+OPENAI_MAX_RETRIES=6
+OPENAI_RETRY_INITIAL_DELAY_SECONDS=20
+OPENAI_RETRY_MAX_DELAY_SECONDS=180
 OPENAI_REQUEST_TIMEOUT_SECONDS=180
 ```
 
@@ -277,6 +286,9 @@ measurement. Automotive wrap films should be prompted as material stacks, not fl
 - metallic flake, pearl, or angle-shift layer when the catalog finish calls for it
 - gloss/matte roughness behavior
 - body-panel reflections that follow curvature and panel gaps
+- visible roll or cut-end cores rendered as a thick reinforced cardboard paper tube core:
+  white inner wall, cream beige paper edge, hollow cylindrical roll core, 3-inch paper core,
+  and visible cross-section
 
 `gpt-image-2` prompts receive the catalog item, approximate color profile, material profile, and
 negative constraints such as no flat paint, no plain RGB fill, no toy-like plastic surface, and no
@@ -289,6 +301,14 @@ as `local_exact_color_match`; family-only or family/finish matches are recorded 
 catalog candidates are not treated as measured truth. The material heuristic checks for highlight,
 texture, and reflection variation so flat RGB fills are visible in the report even when final
 material judgment still belongs to the visual QA model and human catalog review.
+
+Visible automotive-film roll cores are a hard product-accuracy fact, not a generic styling choice.
+Whenever a roll core, roll end, or cut-end cross-section appears, prompts and QA require a thick
+reinforced cardboard paper tube core with a white inner wall, cream beige paper edge, hollow
+cylindrical roll-core geometry, 3-inch paper-core proportion, and visible cross-section. Plastic
+cores, metal sleeves, solid centers, foam/acrylic tubes, glossy colored cores, or thin sticker-like
+rings trigger `roll_core_paper_tube_required`, reduce product/material scores, force retry, and
+block publish until corrected.
 
 `QA_MIN_PHOTOREALISM_SCORE` is a publication gate for generated images that are factually correct
 but visibly synthetic. The OpenAI QA prompt returns `photorealism_score`; scores below the threshold
@@ -330,6 +350,112 @@ separate card, border framework, color strip, or chip layout.
 controls the final ecommerce main-image canvas. The default `cover` fit creates a filled 1:1 image
 for ecommerce use and avoids blurred letterbox bands when the upstream image model returns a
 non-square raster.
+
+Long color-card production runs should treat provider 429/503 responses as transient external
+capacity signals, not product failures. Image generation and visual QA now honor `Retry-After`
+headers and otherwise use configurable exponential backoff through `OPENAI_MAX_RETRIES`,
+`OPENAI_RETRY_INITIAL_DELAY_SECONDS`, and `OPENAI_RETRY_MAX_DELAY_SECONDS`. A generation job that
+failed before producing an output can be requeued by the next idempotent enqueue until its
+`max_attempts` budget is exhausted; color-card production prompts default to 7 attempts so local
+runs can resume after temporary provider throttling.
+
+Color-card production also retries QA `revise` outputs before treating the row as final. The
+executor uses `RetryPlannerService` to compile the QA revision instruction, creates child generation
+jobs until the output passes publish gates or the prompt retry budget is exhausted, re-runs QA after
+each child job, and publishes only the final passing output. JSONL run logs record
+`succeeded_after_retry`, the initial QA decision/score, the final retry job/output IDs, and the retry
+attempt count for audit.
+If visual QA itself fails because the provider is unavailable, the executor keeps the generated
+output and provider-error QA report, marks the plan row as failed in the JSONL log, and lets the next
+idempotent run refresh QA without regenerating the image.
+
+`run-acceptance-loop` adds a business acceptance layer after visual QA without overwriting the
+original QA report. The `vehicle_context_v2` policy treats the vehicle as a valid automotive-film
+detail-scene carrier: `detail_scene`, `clean_edit`, and `catalog_scene_generate` outputs may keep
+recognizable vehicle bodies or model silhouettes when the license plate, logos, badges, readable
+brand text, watermarks, QR codes, fake claims, and official-endorsement cues are absent. Those
+vehicle-model findings become `publish_with_warnings` instead of hard failures. The policy still
+blocks or retries visible plates, grille/wheel/headrest badges, readable text, physically implausible
+vehicle geometry, wrong color-card material, low photorealism, and hard material failures. Published
+override assets carry tags such as `acceptance:publish_with_warnings`,
+`acceptance_policy:vehicle_context_v2`, and `acceptance:downgraded_vehicle_context`.
+
+Example acceptance loop:
+
+```powershell
+python -m app.cli run-acceptance-loop `
+  --report-dir data/reports/acceptance_loop_vehicle_context_v2_dry `
+  --dry-run
+
+python -m app.cli run-acceptance-loop `
+  --report-dir data/reports/acceptance_loop_vehicle_context_v2_apply `
+  --published-dir data/published `
+  --apply
+```
+
+The 2026-06-23 `vehicle_context_v2` pass reviewed 561 outputs. It found one unpublished output that
+was blocked only by allowed vehicle-context wording, published it with warnings, raised the published
+asset count from 368 to 369, and left no remaining unpublished publishable rows in the post-check.
+The final report is in `data/reports/color_card_recovery_20260623_v12_acceptance_final/`.
+
+When source-image edit batches fail because the image edit endpoint times out or the transport drops
+the upload, use `plan-color-card-recovery` to convert failed `clean_edit` rows into
+`catalog_scene_generate` rows. Recovery rows clear `source_filename` and `source_local_path`, set
+`generation_mode=generate`, and prompt `gpt-image-2` to create a fresh generic ecommerce detail
+scene without uploading the supplier source image. The locked color-card item remains the product
+truth, so recovery still preserves item number, color family, finish, material, size, thickness, and
+QA constraints while avoiding copied supplier branding or source layout.
+
+Example recovery plan:
+
+```powershell
+python -m app.cli plan-color-card-recovery `
+  --original-plan-path data/production_runs/color_card_production_20260622/production_plan.csv `
+  --failure-rows-path data/reports/color_card_production_20260623_final/color_card_unpublished_failure_rows.csv `
+  --output-dir data/production_runs/color_card_recovery_20260623_v10
+```
+
+The 2026-06-23 recovery run used this route for 167 unpublished plan rows. The v10 run recovered
+161 rows and left 6 external SSL EOF failures; a v11 small retry plan reissued only those 6 rows with
+new plan IDs and recovered all 6. The final reconciliation is in
+`data/reports/color_card_recovery_20260623_v11_final/final_recovery_reconciliation_summary.json`,
+with the HTML acceptance report at
+`data/reports/color_card_recovery_20260623_v11_final/acceptance_report.html`.
+
+For local high-throughput color-card production against SQLite, enable WAL and a longer busy
+timeout:
+
+```powershell
+$env:DATABASE_URL="sqlite:///./image_factory_color_card_production_20260622.db"
+$env:SQLITE_BUSY_TIMEOUT_MS="120000"
+$env:SQLITE_WAL_ENABLED="true"
+$env:OPENAI_MAX_RETRIES="6"
+$env:OPENAI_RETRY_INITIAL_DELAY_SECONDS="20"
+$env:OPENAI_RETRY_MAX_DELAY_SECONDS="180"
+```
+
+The generation service commits `running/generating` state before calling the external image adapter,
+then commits generated output state before QA, so long provider calls do not hold a SQLite write
+transaction. It also refuses to run jobs that are already `running` or not explicitly `queued`,
+which prevents duplicate external image calls during concurrent resume runs. Retry planning
+requeues failed retry jobs that have no output instead of handing a failed job directly back to the
+generation runner.
+
+Use 4-8 local shard workers for conservative production runs. For full-batch fast-fail sweeps where
+the goal is to make every remaining plan row reach a logged terminal result, this workstation has
+also been run with 16 shard workers, `OPENAI_REQUEST_TIMEOUT_SECONDS=60`, and
+`OPENAI_MAX_RETRIES=1`. That mode increases throughput but treats provider timeouts, SSL EOFs, and
+QA provider failures as terminal row failures in the run report; sustained high-quality generation
+at higher concurrency should use PostgreSQL and a provider capacity pool.
+
+Example four-shard run:
+
+```powershell
+python -m app.cli run-color-card-production --plan-path data/production_runs/color_card_production_20260622/shards/production_plan_shard_01_of_04.csv --generated-dir data/generated/color_card_production_20260622 --log-path data/logs/color_card_production_live_concurrent4_shard01.jsonl
+python -m app.cli run-color-card-production --plan-path data/production_runs/color_card_production_20260622/shards/production_plan_shard_02_of_04.csv --generated-dir data/generated/color_card_production_20260622 --log-path data/logs/color_card_production_live_concurrent4_shard02.jsonl
+python -m app.cli run-color-card-production --plan-path data/production_runs/color_card_production_20260622/shards/production_plan_shard_03_of_04.csv --generated-dir data/generated/color_card_production_20260622 --log-path data/logs/color_card_production_live_concurrent4_shard03.jsonl
+python -m app.cli run-color-card-production --plan-path data/production_runs/color_card_production_20260622/shards/production_plan_shard_04_of_04.csv --generated-dir data/generated/color_card_production_20260622 --log-path data/logs/color_card_production_live_concurrent4_shard04.jsonl
+```
 
 ## Scenario Loop Engineering
 

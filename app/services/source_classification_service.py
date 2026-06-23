@@ -41,6 +41,8 @@ class ColorCardSourceItem(BaseModel):
     finish: str = "unknown"
     swatch_image: str = ""
     raw_item_text: str = ""
+    color_profile: dict[str, Any] = Field(default_factory=dict)
+    material_profile: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceClassificationRow(BaseModel):

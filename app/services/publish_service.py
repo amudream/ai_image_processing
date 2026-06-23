@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -41,16 +41,31 @@ class PublishingService:
         self.library_root = library_root
         self.catalog_info_renderer = CatalogInfoPanelRenderer()
 
-    def publish(self, output: GeneratedOutput) -> PublishedAsset:
+    def publish(
+        self,
+        output: GeneratedOutput,
+        acceptance_override: dict[str, Any] | None = None,
+    ) -> PublishedAsset:
         existing = self.db.scalar(
             select(PublishedAsset).where(PublishedAsset.output_id == output.id)
         )
         if existing is not None:
             return existing
         report = self.db.scalar(select(QAReport).where(QAReport.output_id == output.id))
-        if report is None or report.decision not in {"pass_preferred", "pass_usable"}:
+        accepted_by_policy = bool(
+            acceptance_override
+            and acceptance_override.get("publishable") is True
+            and acceptance_override.get("acceptance_status")
+            in {"publish", "publish_with_warnings"}
+        )
+        if report is None:
+            raise ValueError("Output has no QA report")
+        if (
+            not accepted_by_policy
+            and report.decision not in {"pass_preferred", "pass_usable"}
+        ):
             raise ValueError("Only QA-passed outputs can be published")
-        if not can_publish(report):
+        if not accepted_by_policy and not can_publish(report):
             raise ValueError("QA report does not meet configured publish thresholds")
 
         unit = self.db.get(VisualUnit, output.visual_unit_id)
@@ -95,6 +110,7 @@ class PublishingService:
                 f"product_key:{taxonomy['product_key']}",
                 *taxonomy["tags"],
                 *self._catalog_label_tags(catalog_label),
+                *self._acceptance_tags(acceptance_override),
                 "ecommerce_ready",
             ],
             final_uri=str(final_path.resolve()),
@@ -105,6 +121,20 @@ class PublishingService:
         self.db.add_all([published, output, unit])
         self.db.flush()
         return published
+
+    def _acceptance_tags(self, acceptance_override: dict[str, Any] | None) -> list[str]:
+        if not acceptance_override:
+            return []
+        status = str(acceptance_override.get("acceptance_status") or "").strip()
+        policy_version = str(acceptance_override.get("policy_version") or "").strip()
+        tags = []
+        if status:
+            tags.append(f"acceptance:{status}")
+        if policy_version:
+            tags.append(f"acceptance_policy:{policy_version}")
+        if acceptance_override.get("downgraded_findings"):
+            tags.append("acceptance:downgraded_vehicle_context")
+        return tags
 
     def _taxonomy(self, output: GeneratedOutput, unit: VisualUnit) -> PublishTaxonomy:
         color_card = self._color_card_item(output)
