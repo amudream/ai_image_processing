@@ -50,10 +50,12 @@ class OpenAIMultimodalClient:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.base_url = (base_url or settings.openai_base_url).rstrip("/")
         self.api_key = api_key or settings.openai_api_key
         self.model = model or settings.openai_text_model
+        self.reasoning_effort = reasoning_effort or settings.openai_text_reasoning_effort
 
     def complete_json(self, system: str, user_text: str, image_path: Path) -> dict[str, Any]:
         return self.complete_json_multi(system, user_text, [image_path])
@@ -81,8 +83,8 @@ class OpenAIMultimodalClient:
             "response_format": {"type": "json_object"},
             "store": settings.openai_store,
         }
-        if settings.openai_text_reasoning_effort:
-            payload["reasoning_effort"] = settings.openai_text_reasoning_effort
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         body = self._post_chat(payload)
         response_content = body["choices"][0]["message"]["content"]
         if isinstance(response_content, list):

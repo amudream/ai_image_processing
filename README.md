@@ -62,6 +62,7 @@ python -m app.cli run-production-queue-batch ./data/raw --limit 20 --max-tasks 2
 python -m app.cli run-production-worker --stage generation --max-tasks 20 --report-dir ./data/reports/queue_demo
 python -m app.cli export-published ./data/published
 python -m app.cli classify-source-library --output-dir ./data/reports/source_classification_demo
+python -m app.cli curate-alibaba-listing-library --output-dir ./data/source_curated/alibaba_listing_demo --dry-run
 python -m app.cli plan-color-card-production --output-dir ./data/production_runs/color_card_demo
 python -m app.cli plan-color-card-recovery --output-dir ./data/production_runs/color_card_recovery_demo
 python -m app.cli run-color-card-production --plan-path ./data/production_runs/color_card_demo/production_plan.csv
@@ -107,6 +108,102 @@ Catalog match statuses are intentionally conservative:
 Phase 1 does not move source files, write production DB state, call OpenAI, or generate images. Its
 purpose is to create a controlled candidate queue so later GPT Image 2 requests use source images as
 composition/material evidence while the color-card catalog remains the product truth.
+
+## Alibaba B2B Listing Source Curation
+
+After source classification, run the Alibaba listing curation loop to automatically route source
+images into listing-ready candidates and AI-generation material folders for Alibaba.com B2B product
+publishing. The production path uses an AI vision evaluator; local code is limited to deterministic
+checks such as file existence, dimensions, and output materialization. Human review is not a
+required decision step. The HTML report is for audit only.
+
+Before running a large AI pass, benchmark model and reasoning-effort combinations on a small real
+sample:
+
+```powershell
+$env:OPENAI_MAX_RETRIES="1"
+$env:OPENAI_REQUEST_TIMEOUT_SECONDS="60"
+python -m app.cli benchmark-alibaba-listing-vision `
+  --classification-path ./data/reports/source_classification_20260703/classification_manifest.csv `
+  --source-dir ./data/source/11_unique_images_flat `
+  --output-dir ./data/reports/alibaba_listing_vision_benchmark_20260703 `
+  --models gpt-5.4-mini,gpt-5.5 `
+  --reasoning-efforts low,medium,xhigh `
+  --sample-size 4
+```
+
+The benchmark writes `vision_benchmark_results.csv`, `vision_benchmark_summary.json`, and
+`vision_benchmark_report.html`. Use the recommended model/reasoning pair for broad passes, then use
+a stronger/slower pair only for strict rechecks or ambiguous failures if the benchmark shows value.
+
+```powershell
+python -m app.cli curate-alibaba-listing-library `
+  --classification-path ./data/reports/source_classification_20260622/classification_manifest.csv `
+  --source-dir ./data/source/11_unique_images_flat `
+  --output-dir ./data/source_curated/alibaba_listing_20260703 `
+  --vision-provider openai `
+  --vision-model gpt-5.4-mini `
+  --reasoning-effort low `
+  --limit 100 `
+  --offset 0 `
+  --concurrency 10 `
+  --link-mode hardlink `
+  --dry-run
+```
+
+Use `--apply` to materialize the selected images without a human gating step. Keep `--dry-run` for
+audit-only previews or CI checks:
+
+```powershell
+python -m app.cli curate-alibaba-listing-library `
+  --classification-path ./data/reports/source_classification_20260622/classification_manifest.csv `
+  --source-dir ./data/source/11_unique_images_flat `
+  --output-dir ./data/source_curated/alibaba_listing_20260703_batch0000 `
+  --vision-provider openai `
+  --vision-model gpt-5.4-mini `
+  --reasoning-effort low `
+  --limit 500 `
+  --offset 0 `
+  --concurrency 50 `
+  --link-mode hardlink `
+  --apply
+```
+
+For full-library runs, use one process per batch and let that process own internal concurrency.
+Do not run multiple processes into the same output directory. Advance with `--offset` and write
+each batch to a distinct directory such as `alibaba_listing_20260703_batch0500`,
+`alibaba_listing_20260703_batch1000`, and so on. The manifest summary records the active
+`concurrency`, `offset`, and `limit` for each batch.
+
+The command writes:
+
+- `00_manifest/selection_manifest.csv`: one row per source image with visual type, listing role,
+  AI-material role, B2B score, AI-generation score, risk score, decision, target folders, failure
+  reasons, and cleanup requirements.
+- `00_manifest/selection_summary.json`: counters by decision, product family, visual type, role,
+  target folder, and failure reason.
+- `00_manifest/acceptance_report.html`: Chinese audit report for quick inspection.
+- `00_manifest/selection_log.jsonl`: streamed per-image decision log for progress checks and
+  interruption evidence.
+- `listing_ready_candidates/`: B2B listing candidates for main images and product-detail images,
+  grouped by product family and visual type.
+- `ai_generation_materials/`: sources for color replacement, material reference, and structure
+  reference, grouped by product family before the final material/structure subtype.
+- `manual_review_low_confidence/`: low-confidence residuals; this folder does not block the main
+  automated loop.
+- `rejected/`: images with explicit blockers such as non-domain subjects or source rejects.
+
+Full-vehicle images are first-class assets. Clean full-vehicle or partial-panel images can enter
+`listing_ready_candidates/main_image/<product_family>/full_vehicle_effect` when they are logo-free,
+plate-free, structurally realistic, clearly show the film effect, and are suitable for B2B crop.
+Vehicle images with removable risks such as logos or plates are blocked from listing-ready folders
+but can still enter `ai_generation_materials/color_replace_sources/<product_family>/` with cleanup
+requirements.
+
+`--link-mode hardlink` preserves disk space and never mutates the source pool. If hardlinking fails,
+the service falls back to copying the image. `--link-mode copy` always copies. Use
+`--vision-provider rule` only for local smoke tests or CI checks; it is not accurate enough for
+Alibaba.com listing decisions.
 
 ## AI Provider
 
@@ -553,3 +650,6 @@ and approved publish assets to `data/published`.
 - AI watermark detection is evidence collection, not proof of cleanliness. The upstream tool reports
   unknown when no local metadata or known visible mark is found, because stripped metadata and
   proprietary pixel watermarks may not be locally verifiable.
+- Alibaba listing source curation depends on AI vision model quality and provider latency. Run the
+  benchmark before large batches, keep runs chunked with `--limit`, and treat the output as image
+  suitability screening rather than proof of legal usage rights or platform-policy compliance.

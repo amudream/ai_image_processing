@@ -9,11 +9,19 @@ import typer
 from sqlalchemy import select
 
 from app.adapters.ai_watermark_detection import build_ai_watermark_identifier
+from app.adapters.alibaba_listing_vision import build_alibaba_listing_vision_evaluator
 from app.adapters.image_generation import build_image_generation_adapter
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import VisualUnit
 from app.services.acceptance_policy_service import AcceptancePolicyService
+from app.services.alibaba_listing_selection_service import (
+    AlibabaListingSelectionService,
+    LinkMode,
+)
+from app.services.alibaba_listing_vision_benchmark_service import (
+    AlibabaListingVisionBenchmarkService,
+)
 from app.services.analysis_service import AnalysisService
 from app.services.brief_service import VisualDirectorService
 from app.services.color_card_production_service import ColorCardProductionService
@@ -304,6 +312,109 @@ def classify_source_library(
     )
 
 
+@app.command("curate-alibaba-listing-library")
+def curate_alibaba_listing_library(
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260622/classification_manifest.csv"),
+    source_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/source/11_unique_images_flat"),
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    link_mode: Annotated[LinkMode, typer.Option()] = "hardlink",
+    vision_provider: Annotated[str, typer.Option()] = "openai",
+    vision_model: Annotated[str | None, typer.Option()] = None,
+    reasoning_effort: Annotated[str | None, typer.Option()] = None,
+    limit: Annotated[int | None, typer.Option()] = None,
+    offset: Annotated[int, typer.Option()] = 0,
+    concurrency: Annotated[int, typer.Option()] = 1,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run/--apply"),
+    ] = True,
+) -> None:
+    active_output_dir = output_dir or (
+        Path("data/source_curated")
+        / datetime.now(UTC).strftime("alibaba_listing_%Y%m%dT%H%M%SZ")
+    )
+    result = AlibabaListingSelectionService(
+        classification_path=classification_path,
+        source_dir=source_dir,
+        vision_evaluator=build_alibaba_listing_vision_evaluator(
+            provider=vision_provider,
+            model=vision_model,
+            reasoning_effort=reasoning_effort,
+        ),
+    ).run(
+        output_dir=active_output_dir,
+        dry_run=dry_run,
+        link_mode=link_mode,
+        limit=limit,
+        offset=offset,
+        concurrency=concurrency,
+    )
+    typer.echo(
+        "Alibaba listing library curation complete: "
+        f"total_rows={result.total_rows} "
+        f"dry_run={result.dry_run} "
+        f"concurrency={concurrency} "
+        f"decisions={result.decision_counts}"
+    )
+    typer.echo(
+        "Alibaba listing curation artifacts exported: "
+        f"selection_manifest={result.selection_manifest_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path} "
+        f"log={result.log_path}"
+    )
+
+
+@app.command("benchmark-alibaba-listing-vision")
+def benchmark_alibaba_listing_vision(
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260622/classification_manifest.csv"),
+    source_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/source/11_unique_images_flat"),
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    models: Annotated[str, typer.Option()] = "gpt-5.5,gpt-5.4,gpt-5.4-mini",
+    reasoning_efforts: Annotated[str, typer.Option()] = "low,medium,xhigh",
+    sample_size: Annotated[int, typer.Option()] = 6,
+) -> None:
+    active_output_dir = output_dir or (
+        Path("data/reports")
+        / datetime.now(UTC).strftime("alibaba_listing_vision_benchmark_%Y%m%dT%H%M%SZ")
+    )
+    model_list = _csv_option(models)
+    effort_list = _csv_option(reasoning_efforts)
+    result = AlibabaListingVisionBenchmarkService(
+        classification_path=classification_path,
+        source_dir=source_dir,
+    ).run(
+        output_dir=active_output_dir,
+        models=model_list,
+        reasoning_efforts=effort_list,
+        sample_size=sample_size,
+    )
+    typer.echo(
+        "Alibaba listing vision benchmark complete: "
+        f"total_calls={result.total_calls} "
+        f"successful_calls={result.successful_calls} "
+        f"recommended={result.recommended_model}/{result.recommended_reasoning_effort}"
+    )
+    typer.echo(
+        "Alibaba listing vision benchmark artifacts exported: "
+        f"results={result.results_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path}"
+    )
+
+
 @app.command("plan-color-card-production")
 def plan_color_card_production(
     classification_path: Annotated[
@@ -481,6 +592,10 @@ def detect_ai_watermarks(
 def _default_log_path(prefix: str) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return Path(settings.pipeline_log_dir) / f"{prefix}_{timestamp}.jsonl"
+
+
+def _csv_option(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 if __name__ == "__main__":
