@@ -384,8 +384,8 @@ measurement. Automotive wrap films should be prompted as material stacks, not fl
 - gloss/matte roughness behavior
 - body-panel reflections that follow curvature and panel gaps
 - visible roll or cut-end cores rendered as a thick reinforced cardboard paper tube core:
-  white inner wall, cream beige paper edge, hollow cylindrical roll core, 3-inch paper core,
-  and visible cross-section
+  dominant white/off-white inner opening, white inner wall, cream beige paper edge only as a
+  narrow rim, hollow cylindrical roll core, 3-inch paper core, and visible cross-section
 
 `gpt-image-2` prompts receive the catalog item, approximate color profile, material profile, and
 negative constraints such as no flat paint, no plain RGB fill, no toy-like plastic surface, and no
@@ -401,11 +401,12 @@ material judgment still belongs to the visual QA model and human catalog review.
 
 Visible automotive-film roll cores are a hard product-accuracy fact, not a generic styling choice.
 Whenever a roll core, roll end, or cut-end cross-section appears, prompts and QA require a thick
-reinforced cardboard paper tube core with a white inner wall, cream beige paper edge, hollow
-cylindrical roll-core geometry, 3-inch paper-core proportion, and visible cross-section. Plastic
-cores, metal sleeves, solid centers, foam/acrylic tubes, glossy colored cores, or thin sticker-like
-rings trigger `roll_core_paper_tube_required`, reduce product/material scores, force retry, and
-block publish until corrected.
+reinforced cardboard paper tube core with a dominant white/off-white inner opening, white inner
+wall, cream beige paper edge only as a narrow rim, hollow cylindrical roll-core geometry,
+3-inch paper-core proportion, and visible cross-section. Plastic cores, metal sleeves, solid
+centers, foam/acrylic tubes, glossy colored cores, brown/kraft/tan inner holes, black cores,
+material-colored cores, or thin sticker-like rings trigger `roll_core_paper_tube_required`, reduce
+product/material scores, force retry, and block publish until corrected.
 
 `QA_MIN_PHOTOREALISM_SCORE` is a publication gate for generated images that are factually correct
 but visibly synthetic. The OpenAI QA prompt returns `photorealism_score`; scores below the threshold

@@ -24,6 +24,9 @@ from app.services.alibaba_listing_vision_benchmark_service import (
 )
 from app.services.analysis_service import AnalysisService
 from app.services.brief_service import VisualDirectorService
+from app.services.color_card_inspection_package_service import (
+    ColorCardInspectionPackageService,
+)
 from app.services.color_card_production_service import ColorCardProductionService
 from app.services.color_card_service import ColorCardProfileBuilder
 from app.services.demo_data import ensure_demo_images
@@ -545,6 +548,47 @@ def run_color_card_production(
         f"failed={result.failed}"
     )
     typer.echo(f"Color-card production log: {result.log_path}")
+
+
+@app.command("export-color-card-inspection-package")
+def export_color_card_inspection_package(
+    plan_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/production_runs/color_card_production_20260622/production_plan.csv"),
+    published_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/published"),
+    output_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/review/color_card_inspection_package"),
+    catalog_root: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/catalogs/deekus_new_vinyl"),
+) -> None:
+    result = ColorCardInspectionPackageService(
+        plan_path=plan_path,
+        published_dir=published_dir,
+        output_dir=output_dir,
+        catalog_root=catalog_root,
+    ).export()
+    typer.echo(
+        "Color-card inspection package exported: "
+        f"catalog_items={result.catalog_items} "
+        f"exported_images={result.exported_images} "
+        f"exported_swatches={result.exported_swatches} "
+        f"missing_rows={result.missing_rows}"
+    )
+    typer.echo(
+        "Color-card inspection artifacts: "
+        f"output_dir={result.output_dir} "
+        f"manifest={result.manifest_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path}"
+    )
 
 
 @app.command("detect-ai-watermarks")

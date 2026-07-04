@@ -100,8 +100,9 @@ class OpenAIQAEvaluator:
             "flake or pearl/chameleon effects when specified, and reflections following curved "
             "vehicle panels. A flat paint-like surface is a material-realism failure. "
             f"{ROLL_CORE_PAPER_TUBE_SPEC} Treat plastic roll cores, metal sleeves, solid centers, "
-            "foam cores, acrylic tubes, glossy colored cores, and thin sticker-like rings as "
-            "product-accuracy/material-realism failures whenever a roll core is visible. "
+            "foam cores, acrylic tubes, glossy colored cores, brown kraft-paper-looking cores, "
+            "black cores, material-colored cores, tan inner holes, and thin sticker-like rings "
+            "as product-accuracy/material-realism failures whenever a roll core is visible. "
             "Any automaker badge, grille emblem, wheel center-cap logo, watermark, readable text, "
             "license plate, QR code, barcode, fake certification, or unsupported claim still "
             "visible in the output is a medium or high severity failure and cannot be published. "
@@ -894,8 +895,19 @@ def _wrong_roll_core_issue_text(result: dict[str, object]) -> str:
         "acrylic tube",
         "vinyl core",
         "colored core",
+        "material-colored core",
         "glossy core",
         "glossy plastic",
+        "brown core",
+        "brown roll core",
+        "brown kraft",
+        "kraft-paper",
+        "kraft paper",
+        "tan core",
+        "tan inner",
+        "tan inner hole",
+        "dark tan core",
+        "black core",
         "sticker-like ring",
         "wrong roll core",
         "incorrect roll core",

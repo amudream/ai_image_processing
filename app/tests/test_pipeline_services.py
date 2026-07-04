@@ -560,6 +560,100 @@ def test_qa_blocks_wrong_roll_core_material_even_with_high_scores(
     assert "cream beige paper edge" in report.revision_instruction
 
 
+def test_qa_blocks_brown_kraft_roll_core_even_with_high_scores(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class BrownCoreEvaluator:
+        version = "brown_core_detector"
+
+        def evaluate(self, _output: object, _unit: object) -> dict[str, object]:
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 20,
+                "structure_preservation_score": 20,
+                "failures": [
+                    {
+                        "type": "material_realism",
+                        "severity": "low",
+                        "issue": (
+                            "The visible roll core uses a brown kraft-paper/tan inner hole; "
+                            "real automotive film rolls normally show a white inner opening."
+                        ),
+                        "evidence": "Dark tan core color is visible in the roll cross-section.",
+                        "rule_id": "roll_core_color_mismatch",
+                    }
+                ],
+                "revision_instruction": None,
+                "evaluator": self.version,
+            }
+
+    image_path = tmp_path / "brown_roll_core.png"
+    make_image(image_path)
+    unit = VisualUnit(
+        id="vu_brown_roll_core",
+        sku="CO-WHITE-GLOS",
+        film_type="color_wrap",
+        color_family="white",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_brown_roll_core",
+        visual_brief_id="brief_brown_roll_core",
+        prompt_text="Create a catalog product hero with film rolls.",
+        negative_prompt_text="No logos.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_brown_roll_core",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text},
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_brown_roll_core",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_brown_roll_core",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(image_path),
+        width=640,
+        height=480,
+        status="qa_pending",
+    )
+    db_session.add_all([unit, prompt, job, output])
+    db_session.flush()
+
+    report = QAService(db_session, evaluator=BrownCoreEvaluator()).evaluate(output)
+
+    assert report.decision == "revise"
+    assert not can_publish(report)
+    assert any(
+        failure["rule_id"] == "roll_core_paper_tube_required"
+        for failure in report.failures_json
+    )
+    assert report.product_accuracy_score <= 15
+    assert report.material_realism_score <= 15
+    assert report.revision_instruction is not None
+    assert "dominant white or off-white inner opening" in report.revision_instruction
+
+
 def test_generation_enqueue_requeues_failed_job_without_output(
     tmp_path: Path, db_session: Session
 ) -> None:

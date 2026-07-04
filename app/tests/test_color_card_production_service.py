@@ -154,11 +154,14 @@ def test_plans_catalog_hero_for_each_catalog_item(tmp_path: Path) -> None:
     assert "tiny dust" in hero_prompt.lower()
     assert "layered pet" in hero_prompt.lower()
     assert "thick reinforced cardboard paper tube core" in hero_prompt.lower()
-    assert "white inner wall" in hero_prompt.lower()
-    assert "cream beige paper edge" in hero_prompt.lower()
+    assert "dominant white or off-white inner opening" in hero_prompt.lower()
+    assert "cream beige paper edge only as a narrow rim" in hero_prompt.lower()
+    assert "brown kraft-paper-looking core" in hero_prompt.lower()
     assert "hollow cylindrical roll core" in hero_prompt.lower()
     assert "3-inch paper core" in hero_prompt.lower()
     assert "visible cross-section" in hero_prompt.lower()
+    assert "real camera product photography" in hero_prompt.lower()
+    assert "not a cgi render" in hero_prompt.lower()
     solid_prompt = next(
         row["prompt"]
         for row in plan_rows
@@ -224,8 +227,9 @@ def test_catalog_hero_recovery_preserves_paper_tube_core_spec(tmp_path: Path) ->
     prompt = recovery_rows[0]["prompt"].lower()
     assert recovery_rows[0]["route"] == "catalog_product_hero"
     assert "thick reinforced cardboard paper tube core" in prompt
-    assert "white inner wall" in prompt
-    assert "cream beige paper edge" in prompt
+    assert "dominant white or off-white inner opening" in prompt
+    assert "cream beige paper edge only as a narrow rim" in prompt
+    assert "brown kraft-paper-looking core" in prompt
     assert "hollow cylindrical roll core" in prompt
     assert "3-inch paper core" in prompt
     assert "visible cross-section" in prompt
@@ -350,6 +354,8 @@ def test_recovery_plan_converts_failed_clean_edit_to_generated_scene(
     assert recovery_rows[0]["status"] == "recovery"
     assert clean_edit_row["plan_id"] in recovery_rows[0]["error_message"]
     assert "without uploading the supplier source image" in recovery_rows[0]["prompt"]
+    assert "real camera detail photography" in recovery_rows[0]["prompt"].lower()
+    assert "not a cgi render" in recovery_rows[0]["prompt"].lower()
 
 
 def test_recovery_generated_scene_does_not_bind_source_image_uri(
