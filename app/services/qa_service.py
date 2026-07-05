@@ -15,6 +15,21 @@ from app.core.states import GeneratedOutputStatus, QAReportDecision, VisualUnitS
 from app.models import GeneratedOutput, QAReport, VisualUnit
 from app.services.color_material_qa_service import LocalColorMaterialQAService
 
+SELLABLE_FULL_ROLL_REVISION = (
+    "Regenerate product_page_main as a sellable full-roll unit: one dominant full "
+    "commercial roll of automotive film with a partly unrolled continuous film web. "
+    "Sample cards, loose cut pieces, swatch sheets, and material scraps may appear only "
+    "as small secondary references, never as the main subject; do not use an "
+    "application-only vehicle scene."
+)
+EXACT_SWATCH_VISUAL_REVISION = (
+    "Regenerate using the exact color-card swatch reference as the visual target for "
+    "base color, value, hue direction, finish, metallic/pearl/chameleon behavior, and "
+    "gloss/matte character. Correct the generated film before changing composition; "
+    "do not drift brighter, darker, bluer, redder, yellower, or more saturated than the "
+    "swatch except for plausible photographic highlights."
+)
+
 
 class QAEvaluator(Protocol):
     version: str
@@ -59,6 +74,7 @@ class OpenAIQAEvaluator:
         qa_spec = job.request_json.get("qa_spec", {})
         color_card_match = job.request_json.get("color_card_match")
         color_card_review = job.request_json.get("color_card_review")
+        catalog_swatch_uri = job.request_json.get("catalog_swatch_uri")
         product_facts = job.request_json.get("product_facts")
         product_text_policy = job.request_json.get("product_text_policy")
         source_image_uri = job.request_json.get("source_image_uri")
@@ -99,10 +115,13 @@ class OpenAIQAEvaluator:
             "system: transparent PET top layer, optical depth, gloss or matte behavior, metallic "
             "flake or pearl/chameleon effects when specified, and reflections following curved "
             "vehicle panels. A flat paint-like surface is a material-realism failure. "
-            f"{ROLL_CORE_PAPER_TUBE_SPEC} Treat plastic roll cores, metal sleeves, solid centers, "
-            "foam cores, acrylic tubes, glossy colored cores, brown kraft-paper-looking cores, "
-            "black cores, material-colored cores, tan inner holes, and thin sticker-like rings "
-            "as product-accuracy/material-realism failures whenever a roll core is visible. "
+            f"{ROLL_CORE_PAPER_TUBE_SPEC} For generated images without an exact source/reference, "
+            "treat plastic roll cores, metal sleeves, solid centers, foam cores, acrylic tubes, "
+            "glossy colored cores, brown kraft-paper-looking cores, black cores, material-colored "
+            "cores, tan inner holes, and thin sticker-like rings as product-accuracy/material-"
+            "realism failures whenever a roll core is visible. For source-image edit mode, allow "
+            "a non-white real paper core only when the provided source image clearly has the same "
+            "core and the output preserves it accurately. "
             "Any automaker badge, grille emblem, wheel center-cap logo, watermark, readable text, "
             "license plate, QR code, barcode, fake certification, or unsupported claim still "
             "visible in the output is a medium or high severity failure and cannot be published. "
@@ -110,6 +129,22 @@ class OpenAIQAEvaluator:
             "AI collage layouts, physically implausible film peel edges, uniform synthetic "
             "highlight streaks, plastic-looking material sheets, and surfaces with no camera "
             "noise, micro-defects, depth, or believable photographic lighting. "
+            "When a color-card swatch reference image is provided, compare the generated film "
+            "against that image visually, not only against text or hex values. Ignore tiny printed "
+            "labels on the swatch, but enforce the base color, value, hue direction, finish, "
+            "metallic/pearl/chameleon behavior, and gloss/matte character. For exact_item matches, "
+            "visible base-color or finish drift beyond plausible lighting variation is a product "
+            "accuracy failure with rule_id exact_swatch_visual_match_required. Low-severity color "
+            "notes are allowed only for barely perceptible lighting variation; obvious brighter, "
+            "darker, bluer, redder, yellower, less metallic, or more saturated drift should be "
+            "medium/high severity and cannot publish as a main product image. "
+            "For target_usage product_page_main or route catalog_product_hero, enforce the "
+            "sellable full-roll unit requirement: the main subject must be a full commercial "
+            "roll or large roll of automotive film, preferably with a partly unrolled "
+            "continuous film web, and it must read as the product being sold. If the image "
+            "shows only sample cards, loose cut pieces, swatch sheets, material scraps, or an "
+            "application-only vehicle scene without a dominant roll, add a high severity "
+            "failure with rule_id sellable_full_roll_required and require revision. "
             "For generated material-hero mode, do not penalize the absence of a full vehicle, but "
             "do penalize complete vehicles, front or rear fascia, wheels, grilles, brand-like "
             "lights, or any recognizable production-model silhouette when the prompt asks for "
@@ -181,12 +216,54 @@ Packaging/text-composite rebuild acceptance:
             if (is_packaging_rebuild or is_text_composite_rebuild) and source_image_uri
             else ""
         )
+        should_compare_source = (
+            is_source_edit
+            or is_packaging_rebuild
+            or is_text_composite_rebuild
+            or is_structure_preserve_rebuild
+        ) and source_image_uri
+        catalog_swatch_path = _existing_path(catalog_swatch_uri)
+        swatch_reference_text = (
+            """
+Color-card visual reference image is provided.
+
+Image order:
+1. Color-card swatch reference image
+2. Generated output image
+
+Exact swatch visual-match acceptance:
+- Compare the generated automotive film's dominant base color and finish to the swatch image.
+- Ignore tiny printed text and glare on the swatch, but do not ignore visible hue/value drift.
+- For exact_item matches, fail or revise if the generated film reads as a different color, a much
+  lighter/darker value, a more saturated hue, or a different finish than the swatch.
+- Use rule_id exact_swatch_visual_match_required for blocking exact-swatch mismatch.
+"""
+            if catalog_swatch_path is not None and not should_compare_source
+            else ""
+        )
+        if catalog_swatch_path is not None and should_compare_source:
+            swatch_reference_text = """
+Color-card visual reference image is provided.
+
+Image order:
+1. Source/reference image
+2. Color-card swatch reference image
+3. Generated output image
+
+Exact swatch visual-match acceptance:
+- Use the source image for structure/source preservation only.
+- Use the color-card swatch reference for the catalog film color and finish.
+- For exact_item matches, fail or revise if the generated film reads as a different color, a much
+  lighter/darker value, a more saturated hue, or a different finish than the swatch.
+- Use rule_id exact_swatch_visual_match_required for blocking exact-swatch mismatch.
+"""
         user_text = f"""
 Evaluate this generated image against the expected product visual unit and prompt.
 
 {source_edit_text}
 {structure_preserve_text}
 {packaging_rebuild_text}
+{swatch_reference_text}
 
 Visual unit facts:
 {unit_facts}
@@ -248,18 +325,13 @@ publish_tags: array of strings
 Decision thresholds are computed by the system:
 >=90 pass_preferred, 80-89 pass_usable, 70-79 revise, <70 reject_or_rebrief.
 """
-        should_compare_source = (
-            is_source_edit
-            or is_packaging_rebuild
-            or is_text_composite_rebuild
-            or is_structure_preserve_rebuild
-        ) and source_image_uri
-        if should_compare_source:
-            raw = self.client.complete_json_multi(
-                system,
-                user_text,
-                [Path(str(source_image_uri)), image_path],
-            )
+        image_paths = _qa_image_paths(
+            output_path=image_path,
+            source_image_uri=source_image_uri if should_compare_source else None,
+            catalog_swatch_path=catalog_swatch_path,
+        )
+        if len(image_paths) > 1:
+            raw = self.client.complete_json_multi(system, user_text, image_paths)
         else:
             raw = self.client.complete_json(system, user_text, image_path)
         raw["evaluator"] = self.version
@@ -270,6 +342,29 @@ def build_qa_evaluator() -> QAEvaluator:
     if settings.qa_provider.lower() == "openai":
         return OpenAIQAEvaluator()
     return MockQAEvaluator()
+
+
+def _existing_path(value: object) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value))
+    return path if path.exists() else None
+
+
+def _qa_image_paths(
+    *,
+    output_path: Path,
+    source_image_uri: object | None,
+    catalog_swatch_path: Path | None,
+) -> list[Path]:
+    paths: list[Path] = []
+    source_path = _existing_path(source_image_uri)
+    if source_path is not None:
+        paths.append(source_path)
+    if catalog_swatch_path is not None:
+        paths.append(catalog_swatch_path)
+    paths.append(output_path)
+    return paths
 
 
 class QAService:
@@ -297,6 +392,8 @@ class QAService:
         result = self._with_local_color_material_qa(result, output)
         result = self._with_product_fact_guardrails(result, output)
         result = self._with_roll_core_guardrails(result)
+        result = self._with_sellable_full_roll_guardrails(result, output)
+        result = self._with_exact_swatch_visual_guardrails(result, output)
         result = self._with_layout_only_visual_guardrails(result, output)
         result = self._with_structure_preservation_guardrails(result, output)
         result = self._with_photorealism_guardrails(result)
@@ -523,6 +620,134 @@ class QAService:
             "roll_core_guardrail": {
                 "status": "failed",
                 "required_spec": ROLL_CORE_PAPER_TUBE_SPEC,
+            },
+        }
+
+    def _with_sellable_full_roll_guardrails(
+        self,
+        result: dict[str, object],
+        output: GeneratedOutput,
+    ) -> dict[str, object]:
+        if not _requires_sellable_full_roll(output):
+            return result
+        issue_text = _missing_sellable_full_roll_issue_text(result)
+        if not issue_text:
+            return result
+
+        failures = list(cast(list[dict[str, object]], result["failures"]))
+        if not any(
+            str(failure.get("rule_id", "")) == "sellable_full_roll_required"
+            for failure in failures
+        ):
+            failures.append(
+                _normalize_failure(
+                    {
+                        "type": "product_accuracy",
+                        "severity": "high",
+                        "issue": (
+                            "Product page main image does not show the required sellable "
+                            "full-roll unit."
+                        ),
+                        "evidence": issue_text[:600],
+                        "rule_id": "sellable_full_roll_required",
+                    }
+                )
+            )
+
+        revision_instruction_value = result.get("revision_instruction")
+        if revision_instruction_value:
+            revision_instruction = str(revision_instruction_value)
+            if SELLABLE_FULL_ROLL_REVISION not in revision_instruction:
+                revision_instruction = f"{revision_instruction} {SELLABLE_FULL_ROLL_REVISION}"
+        else:
+            revision_instruction = SELLABLE_FULL_ROLL_REVISION
+
+        return {
+            **result,
+            "product_accuracy_score": min(
+                _score(result.get("product_accuracy_score"), 10, 20),
+                15,
+            ),
+            "composition_score": min(_score(result.get("composition_score"), 6, 10), 7),
+            "commercial_readiness_score": min(
+                _score(result.get("commercial_readiness_score"), 8, 15),
+                11,
+            ),
+            "failures": failures,
+            "revision_instruction": revision_instruction,
+            "sellable_full_roll_guardrail": {
+                "status": "failed",
+                "required_spec": SELLABLE_FULL_ROLL_REVISION,
+            },
+        }
+
+    def _with_exact_swatch_visual_guardrails(
+        self,
+        result: dict[str, object],
+        output: GeneratedOutput,
+    ) -> dict[str, object]:
+        if not _requires_exact_swatch_visual_match(output):
+            return result
+        issue_text = _exact_swatch_visual_issue_text(result)
+        if not issue_text:
+            return result
+
+        failures = []
+        has_exact_swatch_failure = False
+        for failure in cast(list[dict[str, object]], result["failures"]):
+            normalized_failure = _normalize_failure(failure)
+            if (
+                str(normalized_failure.get("rule_id", ""))
+                == "exact_swatch_visual_match_required"
+            ):
+                has_exact_swatch_failure = True
+                if str(normalized_failure.get("severity", "")).lower() not in {
+                    "blocker",
+                    "high",
+                    "major",
+                    "medium",
+                }:
+                    normalized_failure["severity"] = "medium"
+            failures.append(normalized_failure)
+        if not has_exact_swatch_failure:
+            failures.append(
+                _normalize_failure(
+                    {
+                        "type": "color_card_accuracy",
+                        "severity": "medium",
+                        "issue": (
+                            "Generated film color or finish does not visually match the exact "
+                            "color-card swatch reference closely enough for product_page_main."
+                        ),
+                        "evidence": issue_text[:600],
+                        "rule_id": "exact_swatch_visual_match_required",
+                    }
+                )
+            )
+
+        revision_instruction_value = result.get("revision_instruction")
+        if revision_instruction_value:
+            revision_instruction = str(revision_instruction_value)
+            if EXACT_SWATCH_VISUAL_REVISION not in revision_instruction:
+                revision_instruction = f"{revision_instruction} {EXACT_SWATCH_VISUAL_REVISION}"
+        else:
+            revision_instruction = EXACT_SWATCH_VISUAL_REVISION
+
+        return {
+            **result,
+            "product_accuracy_score": min(
+                _score(result.get("product_accuracy_score"), 10, 20),
+                15,
+            ),
+            "commercial_readiness_score": min(
+                _score(result.get("commercial_readiness_score"), 8, 15),
+                11,
+            ),
+            "failures": failures,
+            "revision_instruction": revision_instruction,
+            "exact_swatch_visual_guardrail": {
+                "status": "failed",
+                "required_spec": EXACT_SWATCH_VISUAL_REVISION,
             },
         }
 
@@ -917,6 +1142,166 @@ def _wrong_roll_core_issue_text(result: dict[str, object]) -> str:
         "not paper tube",
     )
     if any(term in text for term in wrong_terms):
+        return text
+    return ""
+
+
+def _requires_sellable_full_roll(output: GeneratedOutput) -> bool:
+    job = output.generation_job
+    if job is None:
+        return False
+    return (
+        job.route == "catalog_product_hero"
+        or job.request_json.get("generation_mode") == "catalog_product_hero"
+    )
+
+
+def _requires_exact_swatch_visual_match(output: GeneratedOutput) -> bool:
+    job = output.generation_job
+    if job is None:
+        return False
+    color_card_match = job.request_json.get("color_card_match")
+    if not isinstance(color_card_match, dict):
+        return False
+    if str(color_card_match.get("confidence") or "") != "exact_item":
+        return False
+    return job.route == "catalog_product_hero" or (
+        job.request_json.get("target_usage") == "product_page_main"
+    )
+
+
+def _exact_swatch_visual_issue_text(result: dict[str, object]) -> str:
+    chunks: list[str] = []
+    failures = result.get("failures", [])
+    if isinstance(failures, list):
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            chunks.extend(
+                str(failure.get(key, ""))
+                for key in ("type", "rule_id", "issue", "evidence")
+            )
+    revision_instruction = result.get("revision_instruction")
+    if revision_instruction:
+        chunks.append(str(revision_instruction))
+
+    text = " ".join(chunks).lower()
+    if not text:
+        return ""
+    direct_rule_terms = (
+        "exact_swatch_visual_match_required",
+        "catalog_color_consistency",
+        "catalog_color_match_deviation",
+        "catalog_color_finish_match",
+        "local_exact_color_match",
+    )
+    if any(term in text for term in direct_rule_terms):
+        return text
+    color_context_terms = (
+        "color-card swatch",
+        "color card swatch",
+        "swatch reference",
+        "catalog swatch",
+        "exact swatch",
+        "catalog color",
+        "color-card reference",
+    )
+    drift_terms = (
+        "different color",
+        "color mismatch",
+        "mismatch",
+        "color drift",
+        "hue drift",
+        "visibly more",
+        "more saturated",
+        "less saturated",
+        "too saturated",
+        "brighter",
+        "lighter",
+        "darker",
+        "bluer",
+        "redder",
+        "yellower",
+        "less metallic",
+        "generic silver",
+        "does not match",
+        "deviation",
+    )
+    if any(term in text for term in color_context_terms) and any(
+        term in text for term in drift_terms
+    ):
+        return text
+    return ""
+
+
+def _missing_sellable_full_roll_issue_text(result: dict[str, object]) -> str:
+    chunks: list[str] = []
+    failures = result.get("failures", [])
+    if isinstance(failures, list):
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            chunks.extend(
+                str(failure.get(key, ""))
+                for key in ("type", "rule_id", "issue", "evidence")
+            )
+    revision_instruction = result.get("revision_instruction")
+    if revision_instruction:
+        chunks.append(str(revision_instruction))
+
+    text = " ".join(chunks).lower()
+    if not text:
+        return ""
+    direct_rule_terms = (
+        "sellable_full_roll_required",
+        "sample_only_catalog_main",
+        "sample-only catalog main",
+        "sample only catalog main",
+    )
+    if any(term in text for term in direct_rule_terms):
+        return text
+
+    missing_roll_terms = (
+        "no full commercial roll",
+        "no full roll",
+        "no visible roll",
+        "without a roll",
+        "missing roll",
+        "lacks a roll",
+        "does not show a roll",
+        "does not show the roll",
+        "not a sellable full-roll unit",
+        "not sellable full-roll",
+        "not a sellable product unit",
+    )
+    sample_only_terms = (
+        "only sample cards",
+        "only swatch cards",
+        "only swatch sheets",
+        "only cut pieces",
+        "sample-only",
+        "sample only",
+        "loose cut pieces",
+        "pile of cut pieces",
+        "material scraps",
+        "application-only vehicle scene",
+        "application only vehicle scene",
+    )
+    context_terms = (
+        "product page main",
+        "product_page_main",
+        "catalog product hero",
+        "catalog main",
+        "main image",
+        "sellable full-roll",
+        "full commercial roll",
+    )
+    has_roll_absence = any(term in text for term in missing_roll_terms)
+    has_sample_only = any(term in text for term in sample_only_terms)
+    has_context = any(term in text for term in context_terms)
+    if has_context and (has_roll_absence or has_sample_only):
+        return text
+    if has_roll_absence and has_sample_only:
         return text
     return ""
 

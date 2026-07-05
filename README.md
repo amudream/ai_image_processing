@@ -385,7 +385,8 @@ measurement. Automotive wrap films should be prompted as material stacks, not fl
 - body-panel reflections that follow curvature and panel gaps
 - visible roll or cut-end cores rendered as a thick reinforced cardboard paper tube core:
   dominant white/off-white inner opening, white inner wall, cream beige paper edge only as a
-  narrow rim, hollow cylindrical roll core, 3-inch paper core, and visible cross-section
+  narrow rim, hollow cylindrical roll core, 3-inch paper core, and visible cross-section by
+  default when no exact source/reference proves a different real core
 
 `gpt-image-2` prompts receive the catalog item, approximate color profile, material profile, and
 negative constraints such as no flat paint, no plain RGB fill, no toy-like plastic surface, and no
@@ -397,16 +398,78 @@ evidence into `QAReport.raw_json` and `outputs.csv`. Exact catalog item mismatch
 as `local_exact_color_match`; family-only or family/finish matches are recorded as review signals so
 catalog candidates are not treated as measured truth. The material heuristic checks for highlight,
 texture, and reflection variation so flat RGB fills are visible in the report even when final
-material judgment still belongs to the visual QA model and human catalog review.
+material judgment still belongs to the visual QA model and human catalog review. This local layer is
+not sufficient for sellable exact color-card main images by itself: small matching regions,
+highlights, shadows, or neutral backgrounds can make pixel statistics look acceptable while the
+perceived product color still visibly drifts from the catalog swatch.
 
 Visible automotive-film roll cores are a hard product-accuracy fact, not a generic styling choice.
 Whenever a roll core, roll end, or cut-end cross-section appears, prompts and QA require a thick
 reinforced cardboard paper tube core with a dominant white/off-white inner opening, white inner
 wall, cream beige paper edge only as a narrow rim, hollow cylindrical roll-core geometry,
-3-inch paper-core proportion, and visible cross-section. Plastic cores, metal sleeves, solid
-centers, foam/acrylic tubes, glossy colored cores, brown/kraft/tan inner holes, black cores,
-material-colored cores, or thin sticker-like rings trigger `roll_core_paper_tube_required`, reduce
-product/material scores, force retry, and block publish until corrected.
+3-inch paper-core proportion, and visible cross-section by default. A 2026-07-05 AI audit of all
+3,109 `product_roll` source images found only 623 visible roll cores; among 608 confident visible
+cores, 429 were white/off-white or light gray. Therefore generated images should avoid visible
+cores when not needed; if a new core is visible without an exact source/reference, it should use a
+white/off-white or light-gray inner opening. Brown/kraft/tan, black, product-colored, or
+metal/plastic-looking cores are allowed only when an exact source/reference image clearly proves
+that real product-specific core and the output preserves it accurately. Otherwise they trigger
+`roll_core_paper_tube_required`, reduce product/material scores, force retry, and block publish
+until corrected.
+
+The 2026-07-05 v2 color-card review batch tightened catalog hero prompts to prefer cropped,
+hidden, or non-visible roll cores. The 5-item review batch (`LM-001`, `LM-003`, `LM-004`,
+`LM-005`, `LM-006`) published all 5 `catalog_product_hero` main images with QA scores
+92-96. Direct `source_image_edit` detail rows were unstable in the same batch: only 1 of 5 passed,
+while 4 failed with QA scores 51-77. Converting those failed detail rows to
+`catalog_scene_generate` recovery rows published all 4 replacements with QA scores 92-96. The final
+inspection package is `data/review/color_card_sku_review_batch_20260705_v2`, and the independent
+roll-core audit of its 10 final images found 6 images with no visible roll core and 4 images with
+realistic white/off-white paper-tube cores with narrow cream-beige rims. For small color-card SKU
+production, prefer generated catalog scenes for failed detail assets instead of repeatedly retrying
+source edits against weak source images.
+
+For full-roll automotive wrap listings, `catalog_product_hero` / `product_page_main` assets must
+read as the sellable B2B unit, not only as color samples. The main subject should be one dominant
+full commercial roll, preferably with a partly unrolled continuous film web that shows the locked
+color and finish. Loose sample cards, swatch sheets, cut pieces, hand-held color cards, and vehicle
+application scenes are still useful, but they belong to detail/reference/scene assets unless they
+are clearly secondary to the commercial roll. The QA loop now blocks sample-only main images with
+`sellable_full_roll_required` even when generic material and photorealism scores are high.
+
+The 2026-07-05 v3 full-roll review batch regenerated only the 5 `product_page_main` main images for
+`LM-001`, `LM-003`, `LM-004`, `LM-005`, and `LM-006` under this stricter sellable-unit standard.
+The first pass published 4 of 5 images with QA scores 95-96; `LM-005` was correctly blocked at QA 68
+because it looked like a material/detail sheet instead of a sellable full roll. A one-row recovery
+plan regenerated `LM-005` as a full roll with a visible white/off-white paper core and passed at QA
+96. The final inspection package is
+`data/review/color_card_sku_review_batch_20260705_v3_fullroll` with 5 exported images, 5 swatches,
+and no missing rows. Its contact sheet is
+`data/review/color_card_sku_review_batch_20260705_v3_fullroll/_contact_sheet_swatch_vs_fullroll_main.png`.
+
+Important correction from the 2026-07-05 exact-swatch review: the v3 full-roll outputs were later
+audited by an AI visual QA pass that received the actual catalog swatch image beside each generated
+image, and all 5 v3 images were rejected for visible swatch color drift. The root cause was that the
+old OpenAI QA prompt received the generated image plus text/HEX/LAB hints, but not the actual swatch
+image, while local color QA allowed a pass when a small closest-color pixel region matched the
+swatch. Exact color-card publication now carries `catalog_swatch_uri` through generation requests,
+sends the swatch image and generated output image together to OpenAI QA, and treats
+`exact_swatch_visual_match_required` as a blocking product-accuracy issue for catalog
+`product_page_main` outputs. Retry planning also prioritizes catalog color/material failures before
+layout retries when the same failure mentions swatches.
+
+The 2026-07-05 v4 strict-swatch review batch reran the 5 full-roll main images under that gate. The
+final inspection package is `data/review/color_card_sku_review_batch_20260705_v4_swatch`: 3 images
+were exported and 2 rows stayed missing because strict swatch QA blocked them. Published items:
+`LM-003`, `LM-005`, and `LM-006`. Blocked items: `LM-001` and `LM-004`. The contact sheets are
+`data/review/color_card_sku_review_batch_20260705_v4_swatch/_contact_sheet_swatch_vs_fullroll_main.png`
+and
+`data/review/color_card_sku_review_batch_20260705_v4_swatch/_contact_sheet_outputs_only.png`.
+`_qa_detail_report.json` records every generation/QA attempt. Strict swatch QA prevents bad color
+outputs from being published, but generation yield still depends on the image model following the
+color reference. The next production improvement should pass the swatch image into generation or
+editing as a visual reference, or add a color-transfer/postprocess adapter before QA, rather than
+relying only on text color instructions.
 
 `QA_MIN_PHOTOREALISM_SCORE` is a publication gate for generated images that are factually correct
 but visibly synthetic. The OpenAI QA prompt returns `photorealism_score`; scores below the threshold

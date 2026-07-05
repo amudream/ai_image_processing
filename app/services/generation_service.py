@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -85,6 +86,7 @@ class GenerationService:
         risk_regions: list[object] = []
         color_card_match: dict[str, object] | None = None
         color_card_review: dict[str, object] = {"status": "not_applicable"}
+        catalog_swatch_uri = ""
         product_text_policy: dict[str, object] = {"mode": "not_applicable"}
         product_facts: dict[str, object] = {}
         structure_manifest: dict[str, object] = {}
@@ -108,6 +110,7 @@ class GenerationService:
             if match is not None:
                 color_card_match = match.model_dump()
                 matched_item = color_card_match.get("item")
+                catalog_swatch_uri = self._catalog_swatch_uri(matched_item)
                 confidence = str(color_card_match.get("confidence") or "")
                 review_status = (
                     "nearest_catalog_substitute"
@@ -151,6 +154,7 @@ class GenerationService:
             "generation_mode": generation_mode,
             "source_asset_id": source_asset_id,
             "source_image_uri": source_asset.source_uri if source_asset is not None else None,
+            "catalog_swatch_uri": catalog_swatch_uri,
             "source_risk_regions": risk_regions,
             "color_card_match": color_card_match,
             "color_card_review": color_card_review,
@@ -199,6 +203,15 @@ class GenerationService:
         return isinstance(item_codes, list) and any(
             isinstance(item_code, str) and item_code.strip() for item_code in item_codes
         )
+
+    def _catalog_swatch_uri(self, matched_item: object) -> str:
+        if not isinstance(matched_item, dict):
+            return ""
+        swatch_image = str(matched_item.get("swatch_image") or "").strip()
+        if not swatch_image:
+            return ""
+        swatch_path = Path(settings.color_card_catalog_path).parent / swatch_image
+        return str(swatch_path.resolve())
 
     def _product_text_policy(
         self,

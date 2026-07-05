@@ -224,6 +224,8 @@ class RetryPlannerService:
             )
             for failure in report.failures_json
         ).lower()
+        if "material" in blob or "color" in blob or "finish" in blob:
+            return "material_retry"
         if any(
             term in blob
             for term in (
@@ -238,8 +240,6 @@ class RetryPlannerService:
             return "structure_retry"
         if "photorealism" in blob or "cgi" in blob or "synthetic" in blob:
             return "photorealism_retry"
-        if "material" in blob or "color" in blob or "finish" in blob:
-            return "material_retry"
         if any(
             term in blob
             for term in (
@@ -348,10 +348,10 @@ class RetryPlannerService:
             return "abort_non_retryable"
         if "text_risk" in failure_axes:
             return "deterministic_template_retry"
-        if "layout_structure" in failure_axes:
-            return "structure_preserve_retry"
         if "catalog_color_material" in failure_axes:
             return "catalog_color_material_retry"
+        if "layout_structure" in failure_axes:
+            return "structure_preserve_retry"
         if "photorealism" in failure_axes:
             return "photorealism_retry"
         if "brand_risk" in failure_axes:

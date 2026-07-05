@@ -41,6 +41,7 @@ from app.services.prompt_service import PromptCompilerService
 from app.services.publish_service import PublishingService
 from app.services.qa_service import (
     MockQAEvaluator,
+    OpenAIQAEvaluator,
     QAService,
     can_publish,
     decide_qa,
@@ -654,6 +655,213 @@ def test_qa_blocks_brown_kraft_roll_core_even_with_high_scores(
     assert "dominant white or off-white inner opening" in report.revision_instruction
 
 
+def test_openai_qa_prompt_requires_sellable_full_roll_for_main_image(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class PromptCaptureClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, list[Path]]] = []
+
+        def complete_json(self, system: str, user_text: str, image_path: Path) -> dict[str, object]:
+            return self.complete_json_multi(system, user_text, [image_path])
+
+        def complete_json_multi(
+            self,
+            system: str,
+            user_text: str,
+            image_paths: list[Path],
+        ) -> dict[str, object]:
+            self.calls.append((system, user_text, image_paths))
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 20,
+                "structure_preservation_score": 20,
+                "failures": [],
+                "revision_instruction": None,
+            }
+
+    image_path = tmp_path / "catalog_main.png"
+    swatch_path = tmp_path / "swatch.png"
+    make_image(image_path)
+    make_image(swatch_path, color=(122, 16, 21))
+    unit = VisualUnit(
+        id="vu_catalog_main_sellable_unit",
+        sku="CO-RED-GLOS",
+        film_type="color_wrap",
+        color_family="red",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_catalog_main_sellable_unit",
+        visual_brief_id="brief_catalog_main_sellable_unit",
+        prompt_text="Create a catalog product hero.",
+        negative_prompt_text="No logos.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_catalog_main_sellable_unit",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={
+            "prompt": prompt.prompt_text,
+            "negative_prompt": prompt.negative_prompt_text,
+            "catalog_swatch_uri": str(swatch_path),
+            "color_card_match": {
+                "confidence": "exact_item",
+                "item": {
+                    "item_no": "LM-001",
+                    "name_en": "Liquid Metal Dragon Blood Red",
+                    "color_family": "red",
+                    "finish": "metallic",
+                },
+            },
+        },
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_catalog_main_sellable_unit",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_catalog_main_sellable_unit",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(image_path),
+        width=1024,
+        height=1024,
+        status="qa_pending",
+    )
+    db_session.add_all([unit, prompt, job, output])
+    db_session.flush()
+    client = PromptCaptureClient()
+
+    OpenAIQAEvaluator(client=client).evaluate(output, unit)  # type: ignore[arg-type]
+
+    assert client.calls
+    system, user_text, called_paths = client.calls[0]
+    assert called_paths == [swatch_path, image_path]
+    qa_prompt = f"{system}\n{user_text}".lower()
+    assert "color-card swatch reference image" in qa_prompt
+    assert "generated output image" in qa_prompt
+    assert "exact_swatch_visual_match_required" in qa_prompt
+    assert "sellable full-roll unit" in qa_prompt
+    assert "full commercial roll" in qa_prompt
+    assert "partly unrolled continuous film web" in qa_prompt
+    assert "only sample cards" in qa_prompt
+    assert "loose cut pieces" in qa_prompt
+    assert "application-only vehicle scene" in qa_prompt
+    assert "sellable_full_roll_required" in qa_prompt
+
+
+def test_qa_blocks_sample_only_main_image_even_with_high_scores(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class SampleOnlyEvaluator:
+        version = "sample_only_detector"
+
+        def evaluate(self, _output: object, _unit: object) -> dict[str, object]:
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 20,
+                "structure_preservation_score": 20,
+                "failures": [
+                    {
+                        "type": "composition",
+                        "severity": "low",
+                        "issue": (
+                            "Product page main image shows only sample cards and loose cut pieces; "
+                            "there is no full commercial roll or sellable full-roll unit."
+                        ),
+                        "evidence": "Sample-only composition without a roll.",
+                        "rule_id": "sample_only_catalog_main",
+                    }
+                ],
+                "revision_instruction": None,
+                "evaluator": self.version,
+            }
+
+    image_path = tmp_path / "sample_only_main.png"
+    make_image(image_path)
+    unit = VisualUnit(
+        id="vu_sample_only_main",
+        sku="CO-RED-GLOS",
+        film_type="color_wrap",
+        color_family="red",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_sample_only_main",
+        visual_brief_id="brief_sample_only_main",
+        prompt_text="Create a catalog product hero.",
+        negative_prompt_text="No text.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_sample_only_main",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text},
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_sample_only_main",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_sample_only_main",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(image_path),
+        width=1024,
+        height=1024,
+        status="qa_pending",
+    )
+    db_session.add_all([unit, prompt, job, output])
+    db_session.flush()
+
+    report = QAService(db_session, evaluator=SampleOnlyEvaluator()).evaluate(output)
+
+    assert report.decision == "revise"
+    assert not can_publish(report)
+    assert report.product_accuracy_score <= 15
+    assert report.commercial_readiness_score <= 11
+    assert any(
+        failure["rule_id"] == "sellable_full_roll_required"
+        for failure in report.failures_json
+    )
+    assert report.revision_instruction is not None
+    assert "full commercial roll" in report.revision_instruction
+    assert "sellable full-roll unit" in report.revision_instruction
+
+
 def test_generation_enqueue_requeues_failed_job_without_output(
     tmp_path: Path, db_session: Session
 ) -> None:
@@ -882,6 +1090,8 @@ def test_generation_request_includes_matched_color_card(
 """,
         encoding="utf-8",
     )
+    swatch_path = tmp_path / "swatches" / "001_LM-001.png"
+    make_image(swatch_path, color=(122, 16, 21))
     monkeypatch.setattr(settings, "color_card_catalog_path", str(catalog_path))
     monkeypatch.setattr(settings, "visual_strategy", "source_aware_factory")
     image_path = tmp_path / "color_wrap_red_metallic_product_roll.png"
@@ -920,6 +1130,10 @@ def test_generation_request_includes_matched_color_card(
     match = job.request_json["color_card_match"]
     assert match["item"]["item_no"] == "LM-001"
     assert match["confidence"] == "family_finish"
+    assert Path(str(job.request_json["catalog_swatch_uri"])).parts[-2:] == (
+        "swatches",
+        "001_LM-001.png",
+    )
     assert "Candidate color-card reference" in payload_prompt
     assert "Locked color-card reference" not in payload_prompt
     assert "Liquid Metal Dragon Blood Red" in payload_prompt
@@ -1477,6 +1691,103 @@ def test_local_color_material_qa_blocks_exact_item_color_mismatch(
         failure.get("rule_id") == "local_exact_color_match"
         for failure in report.failures_json
     )
+
+
+def test_qa_blocks_ai_reported_exact_swatch_color_mismatch_for_catalog_main(
+    tmp_path: Path, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "color_material_qa_enabled", False)
+
+    class SlightColorMismatchEvaluator:
+        version = "test_swatch_color_mismatch"
+
+        def evaluate(self, _output: object, _unit: object) -> dict[str, object]:
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 20,
+                "structure_preservation_score": 20,
+                "failures": [
+                    {
+                        "type": "color_match",
+                        "severity": "low",
+                        "issue": (
+                            "The generated base color is visibly more saturated blue than the "
+                            "exact color-card swatch reference."
+                        ),
+                        "evidence": "Exact swatch is blue-gray; output reads navy blue.",
+                        "rule_id": "exact_swatch_visual_match_required",
+                    }
+                ],
+                "revision_instruction": None,
+                "evaluator": self.version,
+            }
+
+    image_path = tmp_path / "mismatched_blue.png"
+    make_image(image_path, color=(35, 62, 190))
+    unit = VisualUnit(
+        id="vu_swatch_color_mismatch",
+        sku="CO-BLUE-META",
+        film_type="color_wrap",
+        color_family="blue",
+        finish="metallic",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={"color_card_item_no": "LM-004"},
+    )
+    job = GenerationJob(
+        id="job_swatch_color_mismatch",
+        prompt_id="prompt_swatch_color_mismatch",
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={
+            "target_usage": "product_page_main",
+            "color_card_match": {
+                "confidence": "exact_item",
+                "item": {
+                    "item_no": "LM-004",
+                    "name_en": "Liquid Metal SomaTo Blue",
+                    "film_type": "color_wrap",
+                    "color_family": "blue",
+                    "finish": "metallic",
+                },
+            },
+        },
+        status="succeeded",
+        attempt=1,
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_swatch_color_mismatch",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(image_path),
+        width=1024,
+        height=1024,
+        status="qa_pending",
+    )
+    db_session.add_all([unit, job, output])
+    db_session.flush()
+
+    report = QAService(db_session, evaluator=SlightColorMismatchEvaluator()).evaluate(output)
+
+    assert report.decision == "revise"
+    assert not can_publish(report)
+    assert report.product_accuracy_score <= 15
+    assert any(
+        failure["rule_id"] == "exact_swatch_visual_match_required"
+        and failure["severity"] == "medium"
+        for failure in report.failures_json
+    )
+    assert report.revision_instruction is not None
+    assert "exact color-card swatch reference" in report.revision_instruction
 
 
 def test_color_name_catalog_match_allows_different_supplier_item_code(

@@ -11,6 +11,9 @@ from sqlalchemy import select
 from app.adapters.ai_watermark_detection import build_ai_watermark_identifier
 from app.adapters.alibaba_listing_vision import build_alibaba_listing_vision_evaluator
 from app.adapters.image_generation import build_image_generation_adapter
+from app.adapters.product_roll_core_vision import (
+    build_product_roll_core_vision_evaluator,
+)
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import VisualUnit
@@ -34,6 +37,7 @@ from app.services.generation_service import GenerationService
 from app.services.ingestion_service import IngestionService
 from app.services.log_service import PipelineLogger
 from app.services.pipeline_service import PipelineService, ensure_database
+from app.services.product_roll_core_audit_service import ProductRollCoreAuditService
 from app.services.production_queue_service import ProductionQueueService
 from app.services.production_scheduler_service import ProductionSchedulerService
 from app.services.prompt_service import PromptCompilerService
@@ -415,6 +419,57 @@ def benchmark_alibaba_listing_vision(
         f"results={result.results_path} "
         f"summary={result.summary_path} "
         f"html={result.html_report_path}"
+    )
+
+
+@app.command("audit-product-roll-cores")
+def audit_product_roll_cores(
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260703/classification_manifest.csv"),
+    source_dir: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/source/11_unique_images_flat"),
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    vision_provider: Annotated[str, typer.Option()] = "openai",
+    vision_model: Annotated[str | None, typer.Option()] = None,
+    reasoning_effort: Annotated[str | None, typer.Option()] = None,
+    limit: Annotated[int | None, typer.Option()] = None,
+    offset: Annotated[int, typer.Option()] = 0,
+    concurrency: Annotated[int, typer.Option()] = 1,
+) -> None:
+    active_output_dir = output_dir or (
+        Path("data/reports")
+        / datetime.now(UTC).strftime("product_roll_core_audit_%Y%m%dT%H%M%SZ")
+    )
+    evaluator = build_product_roll_core_vision_evaluator(
+        provider=vision_provider,
+        model=vision_model or settings.openai_text_model,
+        reasoning_effort=reasoning_effort or settings.openai_text_reasoning_effort,
+    )
+    result = ProductRollCoreAuditService(
+        classification_path=classification_path,
+        source_dir=source_dir,
+        vision_evaluator=evaluator,
+    ).run(
+        output_dir=active_output_dir,
+        limit=limit,
+        offset=offset,
+        concurrency=concurrency,
+    )
+    typer.echo(
+        "Product-roll core audit complete: "
+        f"total_rows={result.total_rows} "
+        f"recommended_default_rule={result.recommended_default_rule}"
+    )
+    typer.echo(
+        "Product-roll core audit artifacts: "
+        f"manifest={result.manifest_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path} "
+        f"log={result.log_path}"
     )
 
 

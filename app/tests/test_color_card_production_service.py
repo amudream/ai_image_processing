@@ -37,6 +37,12 @@ def _catalog(path: Path) -> None:
                     "color_family": "red",
                     "finish": "metallic",
                     "swatch_image": "swatches/red.png",
+                    "color_profile": {
+                        "hex_approx": "#500B0E",
+                        "median_rgb": [80, 11, 14],
+                        "lab_approx": [15.364, 31.273, 17.733],
+                        "confidence": "approx_from_pdf_swatch",
+                    },
                 },
                 {
                     "item_no": "GL-010A",
@@ -145,7 +151,10 @@ def test_plans_catalog_hero_for_each_catalog_item(tmp_path: Path) -> None:
     assert result.total_plan_rows == 3
     assert [row["target_usage"] for row in plan_rows].count("product_page_main") == 2
     assert any(row["route"] == "clean_edit" for row in plan_rows)
-    hero_prompt = next(row["prompt"] for row in plan_rows if row["route"] == "catalog_product_hero")
+    hero_row = next(row for row in plan_rows if row["route"] == "catalog_product_hero")
+    hero_prompt = hero_row["prompt"]
+    hero_hard_constraints = " ".join(json.loads(hero_row["hard_constraints_json"])).lower()
+    hero_negative_prompt = hero_row["negative_prompt"].lower()
     assert "no headlights" in hero_prompt.lower()
     assert "no wheels" in hero_prompt.lower()
     assert "no wheel arches" in hero_prompt.lower()
@@ -153,10 +162,33 @@ def test_plans_catalog_hero_for_each_catalog_item(tmp_path: Path) -> None:
     assert "no cabin glass" in hero_prompt.lower()
     assert "tiny dust" in hero_prompt.lower()
     assert "layered pet" in hero_prompt.lower()
+    assert "full commercial roll" in hero_prompt.lower()
+    assert "sellable full-roll unit" in hero_prompt.lower()
+    assert "1.52*16.5m" in hero_prompt.lower()
+    assert "one dominant full-width roll" in hero_prompt.lower()
+    assert "partly unrolled continuous film web" in hero_prompt.lower()
+    assert "exact-swatch color calibration" in hero_prompt.lower()
+    assert "#500B0E".lower() in hero_prompt.lower()
+    assert "do not let highlights change the perceived base color" in hero_prompt.lower()
+    assert "sample cards and cut pieces must be secondary" in hero_prompt.lower()
+    assert "sample-only" in hero_negative_prompt
+    assert "loose cut pieces as the main subject" in hero_negative_prompt
+    assert "sellable full-roll unit" in hero_hard_constraints
+    assert "sample-only composition" in hero_hard_constraints
+    assert "prefer compositions where roll ends and inner cores are cropped" in hero_prompt.lower()
+    assert (
+        "primary product evidence should be freestanding swatch sheets"
+        not in hero_prompt.lower()
+    )
+    assert "use a film roll only as secondary context" not in hero_prompt.lower()
+    assert "if a roll end or inner core remains visible" in hero_prompt.lower()
+    assert "roll-core thickness" not in hero_prompt.lower()
+    assert "slight roll-core shadowing" not in hero_prompt.lower()
     assert "thick reinforced cardboard paper tube core" in hero_prompt.lower()
     assert "dominant white or off-white inner opening" in hero_prompt.lower()
     assert "cream beige paper edge only as a narrow rim" in hero_prompt.lower()
     assert "brown kraft-paper-looking core" in hero_prompt.lower()
+    assert "without an exact source/reference" in hero_prompt.lower()
     assert "hollow cylindrical roll core" in hero_prompt.lower()
     assert "3-inch paper core" in hero_prompt.lower()
     assert "visible cross-section" in hero_prompt.lower()
@@ -171,6 +203,16 @@ def test_plans_catalog_hero_for_each_catalog_item(tmp_path: Path) -> None:
     assert "no metallic flake" in solid_prompt.lower()
     assert "not thick acrylic" in solid_prompt.lower()
     assert result.generation_requests_path.exists()
+    requests = [
+        json.loads(line)
+        for line in result.generation_requests_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    hero_request = next(
+        request for request in requests if request["route"] == "catalog_product_hero"
+    )
+    assert Path(hero_request["catalog_swatch_uri"]).parts[-2:] == ("swatches", "red.png")
+    assert hero_request["color_card_match"]["confidence"] == "exact_item"
     assert "No logos" in result.generation_requests_path.read_text(encoding="utf-8")
 
 
@@ -226,10 +268,16 @@ def test_catalog_hero_recovery_preserves_paper_tube_core_spec(tmp_path: Path) ->
     assert recovery.total_plan_rows == 1
     prompt = recovery_rows[0]["prompt"].lower()
     assert recovery_rows[0]["route"] == "catalog_product_hero"
+    assert "full commercial roll" in prompt
+    assert "sellable full-roll unit" in prompt
+    assert "sample-only" in prompt
+    assert "prefer no visible roll core" in prompt
+    assert "crop, hide, or turn away roll ends" in prompt
     assert "thick reinforced cardboard paper tube core" in prompt
     assert "dominant white or off-white inner opening" in prompt
     assert "cream beige paper edge only as a narrow rim" in prompt
     assert "brown kraft-paper-looking core" in prompt
+    assert "without an exact source/reference" in prompt
     assert "hollow cylindrical roll core" in prompt
     assert "3-inch paper core" in prompt
     assert "visible cross-section" in prompt

@@ -464,22 +464,31 @@ class ColorCardProductionService:
 
     def _catalog_hero_row(self, item: ColorCardSourceItem) -> ProductionPlanRow:
         prompt = (
-            "Create a photorealistic ecommerce main product image for our automotive "
-            f"vinyl wrap catalog item {item.item_no} {item.name_en}. Render the film as "
-            f"{item.color_family} {item.finish} {item.material} wrap material with realistic "
-            "transparent top-layer depth, curled film-sheet edges, roll-core thickness, micro "
+            "Create a photorealistic B2B ecommerce main product image for a sellable "
+            "full-roll unit of automotive vinyl wrap: a full commercial roll for catalog "
+            f"item {item.item_no} {item.name_en}, size {item.product_size}, thickness "
+            f"{item.thickness}. Render the film as {item.color_family} {item.finish} "
+            f"{item.material} wrap material with realistic "
+            "transparent top-layer depth, curled film-sheet edges, micro "
             "surface texture, and real camera product photography lighting. This must look like "
             "a real photographed sample-room or factory tabletop product photo, not a CGI render, "
             "not a 3D render, not showroom-perfect synthetic advertising art. Make a pure "
-            "material/product hero "
-            "composition: film rolls, freestanding swatch sheets, loose sample cards, and "
-            "abstract curved material panels on a neutral studio surface. Do not include a real "
+            "material/product hero composition on a neutral studio surface. One dominant "
+            "full-width roll must occupy most of the composition, with a partly unrolled "
+            "continuous film web showing the locked color and finish. Sample cards and cut "
+            "pieces must be secondary: they may appear only as small scale, color, or edge "
+            "references, never as the main subject. Do not make a sample-only composition, "
+            "a pile of loose cut pieces, or a set of swatch cards as the main image. Prefer "
+            "compositions where roll ends and inner cores are cropped, hidden, or not visible. "
+            "If a roll end or inner core remains visible, follow the roll-core product rule "
+            "below exactly. Do not include a real "
             "vehicle body as the background. No headlights, no taillights, no wheels, no tires, "
             "no wheel arches, no windshield, no cabin glass, no door window frames, no grille, "
             "no full front fascia, no hood-to-fender vehicle crop, and no recognizable "
             "production vehicle silhouette. Add restrained real-photography imperfections: "
-            "tiny dust specks, subtle handling marks, non-perfect film edges, slight roll-core "
-            "shadowing, and visible layered PET/vinyl thickness at curled sheet edges. "
+            "tiny dust specks, subtle handling marks, non-perfect film edges, soft contact "
+            "shadows, and visible layered PET/vinyl thickness at curled sheet edges. "
+            f"{self._exact_swatch_color_instruction(item)} "
             f"{ROLL_CORE_PAPER_TUBE_SPEC} "
             f"{self._solid_material_instruction(item)}"
         )
@@ -530,6 +539,32 @@ class ColorCardProductionService:
             f"{no_angle_shift}and no mixed brighter, yellower, redder, or darker sample "
             "variants. Sample cards and curled sheets must be thin flexible 7mil PET/vinyl "
             "film, not thick acrylic or rigid plastic plates."
+        )
+
+    def _exact_swatch_color_instruction(self, item: ColorCardSourceItem) -> str:
+        profile = item.color_profile
+        hex_approx = str(profile.get("hex_approx") or "").strip()
+        median_rgb = profile.get("median_rgb")
+        lab_approx = profile.get("lab_approx")
+        details: list[str] = []
+        if hex_approx:
+            details.append(f"hex_approx={hex_approx}")
+        if isinstance(median_rgb, list) and median_rgb:
+            details.append(f"median_rgb={median_rgb[:3]}")
+        if isinstance(lab_approx, list) and lab_approx:
+            details.append(f"lab_approx={lab_approx[:3]}")
+        if not details:
+            return (
+                "Exact-swatch color calibration: match the catalog swatch image as the visual "
+                "target for base color, value, hue direction, finish, and metallic behavior. "
+                "Do not let highlights change the perceived base color."
+            )
+        return (
+            "Exact-swatch color calibration: match the catalog swatch image as the visual "
+            "target for base color, value, hue direction, finish, and metallic behavior "
+            f"({'; '.join(details)}). Do not let highlights change the perceived base color; "
+            "keep most non-highlight film areas close to the swatch midtone, and avoid brighter, "
+            "darker, bluer, redder, yellower, or more saturated variants than the catalog item."
         )
 
     def _source_edit_row(
@@ -599,9 +634,13 @@ class ColorCardProductionService:
     ) -> ProductionPlanRow:
         prompt = (
             f"{original.prompt} Recovery emphasis: generate a clean catalog product hero from "
-            "scratch with no source image upload. Make the material visibly thin and flexible "
-            "like 7mil PET/vinyl, with curled edges, slight handling marks, realistic roll-core "
-            "shadowing, and one consistent locked catalog color/finish. "
+            "scratch with no source image upload. The main subject must be a sellable "
+            "full-roll unit: one dominant full commercial roll, not a sample-only sheet/card "
+            "layout, with a partly unrolled continuous film web when useful. Make the material "
+            "visibly thin and flexible like 7mil PET/vinyl, with curled edges, slight handling "
+            "marks, soft contact shadows, and one consistent locked catalog color/finish. "
+            "Prefer no visible roll core; crop, hide, or turn away roll ends unless the "
+            "composition truly requires one. "
             f"{ROLL_CORE_PAPER_TUBE_SPEC} Avoid rigid acrylic "
             "cards, thick molded panels, complete vehicles, readable text, badges, or logos."
         )
@@ -658,11 +697,23 @@ class ColorCardProductionService:
             "Vehicle structure must remain realistic: wheels, lights, windows, mirrors, "
             "panel gaps, and reflections are not distorted.",
             "Color, finish, and material must follow the locked color-card item.",
-            "Catalog hero outputs must be pure product/material compositions: film rolls, "
-            "swatches, sample cards, or freestanding curved panels only.",
-            "No real vehicle background, no headlights, no wheels, no wheel arches, "
-            "no windshield, no cabin glass, no grille, no hood-to-fender crop.",
         ]
+        if route == "catalog_product_hero" or target_usage == "product_page_main":
+            hard_constraints.extend(
+                [
+                    "Catalog hero/product_page_main outputs must show a sellable "
+                    "full-roll unit: one dominant full-width roll or large full commercial "
+                    "roll with a partly unrolled continuous film web.",
+                    "Sample-only composition is prohibited: loose sample cards, cut pieces, "
+                    "swatch sheets, or material scraps may appear only as secondary scale/detail "
+                    "references.",
+                    "For generated no-reference catalog heroes, prefer no visible roll core; "
+                    "if one is visible, it must follow the white/off-white/light-gray paper "
+                    "tube rule.",
+                    "No real vehicle background, no headlights, no wheels, no wheel arches, "
+                    "no windshield, no cabin glass, no grille, no hood-to-fender crop.",
+                ]
+            )
         return ProductionPlanRow(
             plan_id=plan_id,
             route=route,
@@ -688,7 +739,10 @@ class ColorCardProductionService:
             negative_prompt=(
                 "No logos, no watermarks, no license plates, no QR codes, no readable text, "
                 "no fake certifications, no unsupported product claims, no distorted vehicle "
-                "geometry, no invented catalog colors, no flat paint-like surface."
+                "geometry, no invented catalog colors, no flat paint-like surface, no colored "
+                "plastic, metal, solid, glossy, black, brown kraft, or material-colored roll "
+                "cores in no-reference generated catalog heroes, no sample-only composition, "
+                "no loose cut pieces as the main subject, no swatch-card-only main image."
             ),
             hard_constraints_json=json.dumps(hard_constraints, ensure_ascii=False),
             generation_mode=generation_mode,
@@ -804,6 +858,11 @@ class ColorCardProductionService:
             "target_usage": row.target_usage,
             "generation_mode": row.generation_mode,
             "source_image_uri": row.source_local_path or None,
+            "catalog_swatch_uri": str(
+                (self.catalog_path.parent / item.swatch_image).resolve()
+            )
+            if item.swatch_image
+            else "",
             "prompt": row.prompt,
             "negative_prompt": row.negative_prompt,
             "hard_constraints": json.loads(row.hard_constraints_json),
