@@ -263,7 +263,7 @@ class ProductionQueueService:
                 idempotency_key=f"queue:publish:{output.id}",
                 priority=100,
             )
-        elif report.decision == "revise":
+        elif report.decision in {"revise", "reject_or_rebrief"}:
             self.stage_runs.enqueue(
                 stage="retry",
                 entity_type="generation_job",

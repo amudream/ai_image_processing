@@ -21,3 +21,23 @@ ROLL_CORE_PAPER_TUBE_REVISION = (
     "cores, acrylic tubes, glossy colored cores, brown kraft-paper-looking cores, black "
     "cores, material-colored cores, tan inner holes, or thin sticker-like rings."
 )
+
+AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC = (
+    "Commercial automotive wrap rolls must read as real wide-format car-film inventory: "
+    "about 1.52 m / 60 inches wide and 16.5 m long for catalog items with size "
+    "1.52*16.5m. The roll should have a long high-aspect horizontal cylinder or broad "
+    "roll-mounted web, not a short stubby roll, gift-wrap roll, narrow tape roll, "
+    "ribbon, decal sheet, tiny sample roll, or cropped strip that could not cover car "
+    "panels. Any unrolled film web must look broad enough for vehicle panels, with a "
+    "wide sheet surface and realistic rolled-layer thickness. Macro/detail crops may "
+    "show only part of the roll or edge, but the visible geometry must still imply a "
+    "large wide-format automotive film roll, not a small sticker or handheld sample."
+)
+
+AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION = (
+    "Regenerate with real automotive wrap roll dimensions: a large 1.52 m / 60-inch "
+    "wide-format commercial roll or broad vehicle-panel-width film web, 16.5 m long "
+    "inventory scale, long high-aspect roll geometry, and no short stubby roll, "
+    "gift-wrap roll, narrow tape roll, ribbon, decal sheet, tiny sample roll, or small "
+    "handheld sample as the main product."
+)

@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 from app.adapters.openai_multimodal import OpenAIMultimodalClient
 from app.core.config import settings
 from app.core.ids import stable_id
-from app.core.product_specs import ROLL_CORE_PAPER_TUBE_REVISION, ROLL_CORE_PAPER_TUBE_SPEC
+from app.core.product_specs import (
+    AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION,
+    AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC,
+    ROLL_CORE_PAPER_TUBE_REVISION,
+    ROLL_CORE_PAPER_TUBE_SPEC,
+)
 from app.core.states import GeneratedOutputStatus, QAReportDecision, VisualUnitStatus
 from app.models import GeneratedOutput, QAReport, VisualUnit
 from app.services.color_material_qa_service import LocalColorMaterialQAService
@@ -61,7 +66,7 @@ class MockQAEvaluator:
 
 
 class OpenAIQAEvaluator:
-    version = "openai_vision_qa_v2_source_compare"
+    version = "openai_vision_qa_v3_source_compare_risk_direction"
 
     def __init__(self, client: OpenAIMultimodalClient | None = None) -> None:
         self.client = client or OpenAIMultimodalClient()
@@ -145,6 +150,11 @@ class OpenAIQAEvaluator:
             "shows only sample cards, loose cut pieces, swatch sheets, material scraps, or an "
             "application-only vehicle scene without a dominant roll, add a high severity "
             "failure with rule_id sellable_full_roll_required and require revision. "
+            f"{AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC} For product_page_main, if the roll "
+            "looks like a short stubby roll, gift-wrap roll, narrow tape roll, ribbon, "
+            "decal sheet, tiny sample roll, or a small handheld sample instead of a "
+            "wide-format automotive wrap roll, add a high severity failure with rule_id "
+            "commercial_roll_dimension_required and require revision. "
             "For generated material-hero mode, do not penalize the absence of a full vehicle, but "
             "do penalize complete vehicles, front or rear fascia, wheels, grilles, brand-like "
             "lights, or any recognizable production-model silhouette when the prompt asks for "
@@ -310,7 +320,11 @@ right-side column, or a grid/stack of placeholder cards is a composition and com
 failure.
 
 Return JSON with exactly these keys:
-risk_score: 0-20
+Scoring direction: every numeric score is higher-is-better.
+risk_score is a risk-control/safety score: 20 means no visible publish risk,
+0 means severe publish risk.
+Do not use a low risk_score to mean low risk.
+risk_score: 0-20 risk-control/safety score
 product_accuracy_score: 0-20
 material_realism_score: 0-20
 vehicle_integrity_score: 0-15
@@ -381,7 +395,11 @@ class QAService:
     def evaluate(self, output: GeneratedOutput) -> QAReport:
         existing = self.db.scalar(select(QAReport).where(QAReport.output_id == output.id))
         if existing is not None:
-            if not _is_provider_error_report(existing):
+            is_stale_report = (
+                existing.evaluator_version != self.evaluator.version
+                or existing.policy_version != settings.qa_policy_version
+            )
+            if not is_stale_report and not _is_provider_error_report(existing):
                 return existing
 
         unit = self.db.get(VisualUnit, output.visual_unit_id)
@@ -393,6 +411,7 @@ class QAService:
         result = self._with_product_fact_guardrails(result, output)
         result = self._with_roll_core_guardrails(result)
         result = self._with_sellable_full_roll_guardrails(result, output)
+        result = self._with_commercial_roll_geometry_guardrails(result, output)
         result = self._with_exact_swatch_visual_guardrails(result, output)
         result = self._with_layout_only_visual_guardrails(result, output)
         result = self._with_structure_preservation_guardrails(result, output)
@@ -634,11 +653,22 @@ class QAService:
         if not issue_text:
             return result
 
-        failures = list(cast(list[dict[str, object]], result["failures"]))
-        if not any(
-            str(failure.get("rule_id", "")) == "sellable_full_roll_required"
-            for failure in failures
-        ):
+        failures = []
+        has_sellable_full_roll_failure = False
+        for failure in cast(list[dict[str, object]], result["failures"]):
+            normalized_failure = _normalize_failure(failure)
+            if str(normalized_failure.get("rule_id", "")) == "sellable_full_roll_required":
+                has_sellable_full_roll_failure = True
+                if str(normalized_failure.get("severity", "")).lower() not in {
+                    "blocker",
+                    "high",
+                    "major",
+                    "medium",
+                }:
+                    normalized_failure["severity"] = "high"
+            failures.append(normalized_failure)
+
+        if not has_sellable_full_roll_failure:
             failures.append(
                 _normalize_failure(
                     {
@@ -678,6 +708,80 @@ class QAService:
             "sellable_full_roll_guardrail": {
                 "status": "failed",
                 "required_spec": SELLABLE_FULL_ROLL_REVISION,
+            },
+        }
+
+    def _with_commercial_roll_geometry_guardrails(
+        self,
+        result: dict[str, object],
+        output: GeneratedOutput,
+    ) -> dict[str, object]:
+        if not _requires_sellable_full_roll(output):
+            return result
+        issue_text = _commercial_roll_geometry_issue_text(result)
+        if not issue_text:
+            return result
+
+        failures = []
+        has_commercial_roll_dimension_failure = False
+        for failure in cast(list[dict[str, object]], result["failures"]):
+            normalized_failure = _normalize_failure(failure)
+            if (
+                str(normalized_failure.get("rule_id", ""))
+                == "commercial_roll_dimension_required"
+            ):
+                has_commercial_roll_dimension_failure = True
+                if str(normalized_failure.get("severity", "")).lower() not in {
+                    "blocker",
+                    "high",
+                    "major",
+                    "medium",
+                }:
+                    normalized_failure["severity"] = "high"
+            failures.append(normalized_failure)
+
+        if not has_commercial_roll_dimension_failure:
+            failures.append(
+                _normalize_failure(
+                    {
+                        "type": "product_accuracy",
+                        "severity": "high",
+                        "issue": (
+                            "Product page main image does not match wide-format "
+                            "automotive wrap roll dimensions."
+                        ),
+                        "evidence": issue_text[:600],
+                        "rule_id": "commercial_roll_dimension_required",
+                    }
+                )
+            )
+
+        revision_instruction_value = result.get("revision_instruction")
+        if revision_instruction_value:
+            revision_instruction = str(revision_instruction_value)
+            if AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION not in revision_instruction:
+                revision_instruction = (
+                    f"{revision_instruction} {AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION}"
+                )
+        else:
+            revision_instruction = AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION
+
+        return {
+            **result,
+            "product_accuracy_score": min(
+                _score(result.get("product_accuracy_score"), 10, 20),
+                15,
+            ),
+            "composition_score": min(_score(result.get("composition_score"), 6, 10), 7),
+            "commercial_readiness_score": min(
+                _score(result.get("commercial_readiness_score"), 8, 15),
+                11,
+            ),
+            "failures": failures,
+            "revision_instruction": revision_instruction,
+            "commercial_roll_geometry_guardrail": {
+                "status": "failed",
+                "required_spec": AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC,
             },
         }
 
@@ -1302,6 +1406,75 @@ def _missing_sellable_full_roll_issue_text(result: dict[str, object]) -> str:
     if has_context and (has_roll_absence or has_sample_only):
         return text
     if has_roll_absence and has_sample_only:
+        return text
+    return ""
+
+
+def _commercial_roll_geometry_issue_text(result: dict[str, object]) -> str:
+    chunks: list[str] = []
+    failures = result.get("failures", [])
+    if isinstance(failures, list):
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            chunks.extend(
+                str(failure.get(key, ""))
+                for key in ("type", "rule_id", "issue", "evidence")
+            )
+    revision_instruction = result.get("revision_instruction")
+    if revision_instruction:
+        chunks.append(str(revision_instruction))
+
+    text = " ".join(chunks).lower()
+    if not text:
+        return ""
+
+    direct_rule_terms = (
+        "commercial_roll_dimension_required",
+        "wide_format_roll_required",
+        "automotive_wrap_roll_geometry",
+        "roll_dimension_mismatch",
+        "full_width_roll_proportion",
+    )
+    if any(term in text for term in direct_rule_terms):
+        return text
+
+    wrong_geometry_terms = (
+        "short stubby roll",
+        "stubby roll",
+        "short roll",
+        "gift-wrap roll",
+        "gift wrap roll",
+        "narrow tape roll",
+        "tape-like roll",
+        "tape roll",
+        "ribbon roll",
+        "decal sheet",
+        "tiny sample roll",
+        "small sample roll",
+        "handheld sample",
+        "too narrow",
+        "not wide-format",
+        "not wide format",
+        "not broad enough",
+        "could not cover car panels",
+        "could not cover vehicle panels",
+    )
+    context_terms = (
+        "product page main",
+        "product_page_main",
+        "catalog product hero",
+        "catalog main",
+        "main image",
+        "full commercial roll",
+        "automotive wrap roll",
+        "car-film",
+        "vehicle-panel-width",
+        "wide-format",
+    )
+    if any(term in text for term in wrong_geometry_terms) and any(
+        term in text for term in context_terms
+    ):
         return text
     return ""
 

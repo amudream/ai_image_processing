@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from typing import cast
 
@@ -57,6 +59,12 @@ from app.services.visual_unit_service import VisualUnitService
 def make_image(path: Path, color: tuple[int, int, int] = (180, 180, 180)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (640, 480), color=color).save(path)
+
+
+def _png_b64(color: tuple[int, int, int] = (180, 180, 180)) -> str:
+    buffer = BytesIO()
+    Image.new("RGB", (16, 16), color=color).save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def make_infographic_placeholder_image(path: Path) -> None:
@@ -761,10 +769,17 @@ def test_openai_qa_prompt_requires_sellable_full_roll_for_main_image(
     assert "sellable full-roll unit" in qa_prompt
     assert "full commercial roll" in qa_prompt
     assert "partly unrolled continuous film web" in qa_prompt
+    assert "1.52 m / 60 inches wide" in qa_prompt
+    assert "short stubby roll" in qa_prompt
+    assert "narrow tape roll" in qa_prompt
+    assert "commercial_roll_dimension_required" in qa_prompt
     assert "only sample cards" in qa_prompt
     assert "loose cut pieces" in qa_prompt
     assert "application-only vehicle scene" in qa_prompt
     assert "sellable_full_roll_required" in qa_prompt
+    assert "risk_score is a risk-control/safety score" in qa_prompt
+    assert "20 means no visible publish risk" in qa_prompt
+    assert "0 means severe publish risk" in qa_prompt
 
 
 def test_qa_blocks_sample_only_main_image_even_with_high_scores(
@@ -860,6 +875,109 @@ def test_qa_blocks_sample_only_main_image_even_with_high_scores(
     assert report.revision_instruction is not None
     assert "full commercial roll" in report.revision_instruction
     assert "sellable full-roll unit" in report.revision_instruction
+
+
+def test_qa_blocks_short_stubby_main_roll_even_with_high_scores(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class StubbyRollEvaluator:
+        version = "stubby_roll_detector"
+
+        def evaluate(self, _output: object, _unit: object) -> dict[str, object]:
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 20,
+                "structure_preservation_score": 20,
+                "failures": [
+                    {
+                        "type": "composition",
+                        "severity": "low",
+                        "issue": (
+                            "The product_page_main image reads as a short stubby roll "
+                            "or narrow tape roll, not a wide-format automotive wrap roll."
+                        ),
+                        "evidence": (
+                            "The visible film web is too narrow and could not cover car panels."
+                        ),
+                        "rule_id": "commercial_roll_dimension_required",
+                    }
+                ],
+                "revision_instruction": None,
+                "evaluator": self.version,
+            }
+
+    image_path = tmp_path / "stubby_roll_main.png"
+    make_image(image_path)
+    unit = VisualUnit(
+        id="vu_stubby_roll_main",
+        sku="CO-RED-GLOS",
+        film_type="color_wrap",
+        color_family="red",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_stubby_roll_main",
+        visual_brief_id="brief_stubby_roll_main",
+        prompt_text="Create a catalog product hero.",
+        negative_prompt_text="No text.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_stubby_roll_main",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={"prompt": prompt.prompt_text},
+        status="succeeded",
+        attempt=1,
+        max_attempts=7,
+        root_job_id="job_stubby_roll_main",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_stubby_roll_main",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(image_path),
+        width=1024,
+        height=1024,
+        status="qa_pending",
+    )
+    db_session.add_all([unit, prompt, job, output])
+    db_session.flush()
+
+    report = QAService(db_session, evaluator=StubbyRollEvaluator()).evaluate(output)
+
+    assert report.decision == "revise"
+    assert not can_publish(report)
+    assert report.product_accuracy_score <= 15
+    assert report.commercial_readiness_score <= 11
+    assert any(
+        failure["rule_id"] == "commercial_roll_dimension_required"
+        for failure in report.failures_json
+    )
+    dimension_failure = next(
+        failure
+        for failure in report.failures_json
+        if failure["rule_id"] == "commercial_roll_dimension_required"
+    )
+    assert dimension_failure["severity"] == "high"
+    assert report.revision_instruction is not None
+    assert "1.52 m / 60-inch" in report.revision_instruction
+    assert "narrow tape roll" in report.revision_instruction
 
 
 def test_generation_enqueue_requeues_failed_job_without_output(
@@ -2030,6 +2148,128 @@ def test_openai_image_adapter_prepares_source_edit_payload(tmp_path: Path) -> No
     assert edit_payload["source_filename"] == source_path.name
 
 
+def test_openai_image_adapter_uses_catalog_swatch_reference_for_generated_color_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    swatch_path = tmp_path / "swatch.png"
+    make_image(swatch_path, color=(78, 85, 87))
+    generated_b64 = _png_b64(color=(80, 84, 86))
+    calls: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            calls.append({"url": url, **kwargs})
+            return httpx.Response(
+                200,
+                json={"data": [{"b64_json": generated_b64}]},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("app.adapters.image_generation.httpx.Client", FakeClient)
+    job = GenerationJob(
+        id="job_catalog_swatch_reference_generate",
+        prompt_id="prompt_catalog_swatch_reference_generate",
+        visual_unit_id="vu_catalog_swatch_reference_generate",
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={
+            "prompt": "Create a full-roll product hero matching the color-card swatch.",
+            "negative_prompt": "wrong color",
+            "hard_constraints": ["match_exact_swatch=true"],
+            "qa_spec": {"must_pass": ["exact swatch color"]},
+            "generation_mode": "generate",
+            "source_image_uri": None,
+            "catalog_swatch_uri": str(swatch_path),
+            "color_card_match": {
+                "confidence": "exact_item",
+                "item": {
+                    "item_no": "LM-004",
+                    "name_en": "Liquid Metal SomaTo Blue",
+                    "color_family": "blue",
+                    "finish": "metallic",
+                },
+            },
+        },
+        status="queued",
+        attempt=1,
+        priority=1,
+    )
+
+    result = OpenAIImageGenerationAdapter(
+        output_dir=tmp_path / "generated",
+        base_url="https://example.test",
+        api_key="test",
+    ).generate(job)
+
+    assert result["image_uri"]
+    assert calls[0]["url"] == "https://example.test/images/edits"
+    data = cast(dict[str, object], calls[0]["data"])
+    assert data["input_fidelity"] == "high"
+    prompt_text = str(data["prompt"])
+    assert "Uploaded catalog swatch reference image" in prompt_text
+    assert "must not appear as a visible card or label in the output" in prompt_text
+    file_entries = cast(list[tuple[str, tuple[str, bytes, str]]], calls[0]["files"])
+    assert isinstance(file_entries, list)
+    assert [entry[0] for entry in file_entries] == ["image[]"]
+    assert file_entries[0][1][0] == swatch_path.name
+
+
+def test_openai_image_adapter_uploads_source_and_swatch_references(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.png"
+    swatch_path = tmp_path / "swatch.png"
+    make_image(source_path)
+    make_image(swatch_path, color=(78, 85, 87))
+    calls: list[dict[str, object]] = []
+
+    class FakeClient:
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            calls.append({"url": url, **kwargs})
+            return httpx.Response(
+                200,
+                json={"data": [{"b64_json": _png_b64()}]},
+                request=httpx.Request("POST", url),
+            )
+
+    adapter = OpenAIImageGenerationAdapter(base_url="https://example.test", api_key="test")
+    payload = {
+        "model": "gpt-image-2",
+        "prompt": "Use the second input image only as the exact color swatch reference.",
+        "n": 1,
+        "size": settings.openai_image_size,
+        "quality": "high",
+        "background": "auto",
+        "output_format": "png",
+        "input_fidelity": "high",
+        "source_risk_regions": [],
+    }
+
+    response = adapter._post_edit_once(
+        cast(httpx.Client, FakeClient()),
+        payload,
+        [source_path, swatch_path],
+    )
+
+    assert response.status_code == 200
+    assert calls[0]["url"] == "https://example.test/images/edits"
+    data = cast(dict[str, object], calls[0]["data"])
+    assert data["input_fidelity"] == "high"
+    file_entries = cast(list[tuple[str, tuple[str, bytes, str]]], calls[0]["files"])
+    assert isinstance(file_entries, list)
+    assert [entry[0] for entry in file_entries] == ["image[]", "image[]"]
+    assert [entry[1][0] for entry in file_entries] == [source_path.name, swatch_path.name]
+
+
 def test_openai_image_adapter_normalizes_ecommerce_canvas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2161,6 +2401,58 @@ def test_end_to_end_pipeline(tmp_path: Path, db_session: Session) -> None:
     assert result["attempted_generation_jobs"] <= 20
 
 
+def test_pipeline_keeps_repairing_generated_outputs_until_publishable(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class ReviseTwiceThenPassEvaluator:
+        version = "test_repair_until_publishable"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, _output: GeneratedOutput, _unit: VisualUnit | None) -> dict[str, object]:
+            self.calls += 1
+            if self.calls <= 2:
+                return {
+                    "risk_score": 16,
+                    "product_accuracy_score": 16,
+                    "material_realism_score": 16,
+                    "vehicle_integrity_score": 12,
+                    "composition_score": 7,
+                    "commercial_readiness_score": 8,
+                    "failures": [],
+                    "revision_instruction": "Improve product realism before publishing.",
+                }
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "failures": [],
+                "revision_instruction": None,
+            }
+
+    evaluator = ReviseTwiceThenPassEvaluator()
+    make_image(tmp_path / "color_wrap_red_gloss_installed.png", color=(200, 40, 40))
+
+    result = PipelineService(
+        db_session,
+        generated_dir=tmp_path / "generated",
+        published_dir=tmp_path / "published",
+        generation_adapter=MockImageGenerationAdapter(tmp_path / "generated"),
+        analyst=MockImageAnalyst(),
+        qa_evaluator=evaluator,
+    ).run(tmp_path, limit=1, max_generation_jobs=3)
+
+    jobs = db_session.query(GenerationJob).order_by(GenerationJob.attempt).all()
+    assert result["published"] == 1
+    assert result["attempted_generation_jobs"] == 3
+    assert evaluator.calls == 3
+    assert [job.attempt for job in jobs] == [1, 2, 3]
+
+
 def test_production_scheduler_records_stage_runs(tmp_path: Path, db_session: Session) -> None:
     make_image(tmp_path / "ppf_clear_water_beading.png", color=(180, 180, 180))
     make_image(tmp_path / "color_wrap_red_gloss_installed.png", color=(200, 40, 40))
@@ -2265,6 +2557,67 @@ def test_production_queue_drains_with_stage_claims(tmp_path: Path, db_session: S
     assert result["remaining_runnable"] == 0
     assert db_session.query(PublishedAsset).count() >= 1
     assert {"ingest", "analysis", "visual_unit_build", "generation", "qa", "publish"} <= stages
+
+
+def test_production_queue_rebriefs_generated_outputs_until_publishable(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class RebriefThenPassEvaluator:
+        version = "test_queue_rebrief_until_publishable"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, _output: GeneratedOutput, _unit: VisualUnit | None) -> dict[str, object]:
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "risk_score": 8,
+                    "product_accuracy_score": 9,
+                    "material_realism_score": 9,
+                    "vehicle_integrity_score": 8,
+                    "composition_score": 4,
+                    "commercial_readiness_score": 4,
+                    "failures": [
+                        {
+                            "type": "composition",
+                            "severity": "high",
+                            "rule_id": "generated_product_not_publishable",
+                            "issue": "Generated product image is not publishable.",
+                        }
+                    ],
+                    "revision_instruction": None,
+                }
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "failures": [],
+                "revision_instruction": None,
+            }
+
+    evaluator = RebriefThenPassEvaluator()
+    make_image(tmp_path / "color_wrap_red_gloss_installed.png", color=(200, 40, 40))
+    queue = ProductionQueueService(
+        db_session,
+        generated_dir=tmp_path / "generated",
+        published_dir=tmp_path / "published",
+        generation_adapter=MockImageGenerationAdapter(tmp_path / "generated"),
+        analyst=MockImageAnalyst(),
+        qa_evaluator=evaluator,
+    )
+
+    queue.enqueue_batch(tmp_path, limit=1)
+    result = queue.drain(max_tasks=50)
+
+    stages = {run.stage for run in db_session.query(JobStageRun).all()}
+    assert result["remaining_runnable"] == 0
+    assert db_session.query(PublishedAsset).count() == 1
+    assert evaluator.calls == 2
+    assert "retry" in stages
 
 
 def test_layout_only_qa_guardrail_rejects_large_right_blank_area(
@@ -2704,6 +3057,8 @@ def test_catalog_product_hero_retry_instruction_targets_thin_flexible_material(
     assert "catalog product hero mode" in instruction
     assert "paper-thin" in instruction
     assert "rigid acrylic" in instruction
+    assert "1.52 m / 60 inches" in instruction
+    assert "narrow tape roll" in instruction
     assert "thick reinforced cardboard paper tube core" in instruction
     assert "white inner wall" in instruction
     assert "cream beige paper edge" in instruction
@@ -2711,6 +3066,111 @@ def test_catalog_product_hero_retry_instruction_targets_thin_flexible_material(
     assert "3-inch paper core" in instruction
     assert "visible cross-section" in instruction
     assert "Do not switch to a vehicle" in instruction
+
+
+def test_near_pass_catalog_roll_core_failure_retries_as_source_image_edit(
+    tmp_path: Path,
+    db_session: Session,
+) -> None:
+    source_output_path = tmp_path / "generated" / "lm004_near_pass.png"
+    swatch_path = tmp_path / "swatches" / "lm004.png"
+    make_image(source_output_path, color=(142, 48, 44))
+    make_image(swatch_path, color=(141, 46, 42))
+    unit = VisualUnit(
+        id="vu_catalog_hero_local_repair",
+        sku="LM-004",
+        film_type="color_wrap",
+        color_family="red",
+        finish="gloss",
+        target_usage="product_page_main",
+        source_asset_ids=[],
+        priority=30,
+        status="qa_pending",
+        metadata_json={},
+    )
+    prompt = PromptRecord(
+        id="prompt_catalog_hero_local_repair",
+        visual_brief_id="brief_catalog_hero_local_repair",
+        prompt_text="Create a full-roll catalog hero matching the swatch.",
+        negative_prompt_text="No text.",
+        hard_constraints_json=[],
+        retry_policy_json={"max_attempts": 7, "retryable": True},
+        prompt_version=1,
+    )
+    job = GenerationJob(
+        id="job_catalog_hero_local_repair",
+        prompt_id=prompt.id,
+        visual_unit_id=unit.id,
+        route="catalog_product_hero",
+        model="gpt-image-2",
+        request_json={
+            "prompt": prompt.prompt_text,
+            "generation_mode": "generate",
+            "source_image_uri": None,
+            "catalog_swatch_uri": str(swatch_path),
+            "color_card_match": {"sku": "LM-004", "hex": "#8d2e2a"},
+        },
+        status="succeeded",
+        attempt=2,
+        max_attempts=7,
+        root_job_id="job_catalog_hero_local_repair",
+        priority=30,
+    )
+    output = GeneratedOutput(
+        id="out_catalog_hero_local_repair",
+        generation_job_id=job.id,
+        visual_unit_id=unit.id,
+        image_uri=str(source_output_path),
+        width=1024,
+        height=1024,
+        status="qa_fail",
+    )
+    report = QAReport(
+        id="qa_catalog_hero_local_repair",
+        output_id=output.id,
+        total_score=89,
+        decision="revise",
+        risk_score=20,
+        product_accuracy_score=16,
+        material_realism_score=17,
+        vehicle_integrity_score=15,
+        composition_score=9,
+        commercial_readiness_score=12,
+        failures_json=[
+            {
+                "type": "product_accuracy",
+                "severity": "medium",
+                "issue": (
+                    "The visible roll end has a dark gray core instead of a "
+                    "white/off-white paper tube."
+                ),
+                "rule_id": "roll_core_material_accuracy_required",
+            }
+        ],
+        revision_instruction=(
+            "Repair the visible roll end/core only. Preserve the approved color and composition."
+        ),
+    )
+    db_session.add_all([unit, prompt, job, output, report])
+    db_session.flush()
+
+    retry_job = RetryPlannerService(db_session).create_retry_job(job, report)
+
+    assert retry_job is not None
+    assert retry_job.route == "clean_edit"
+    assert retry_job.request_json["generation_mode"] == "source_image_edit"
+    assert retry_job.request_json["source_image_uri"] == str(source_output_path)
+    assert retry_job.request_json["catalog_swatch_uri"] == str(swatch_path)
+    assert retry_job.request_json["retry_plan"]["retry_strategy"] == (
+        "localized_roll_core_source_edit"
+    )
+    assert "repair_roll_core_or_hide_wrong_roll_end" in retry_job.request_json["retry_plan"][
+        "deterministic_actions"
+    ]
+    instruction = str(retry_job.request_json["revision_instruction"])
+    assert "Use the previous generated output as the source image" in instruction
+    assert "white or off-white paper tube" in instruction
+    assert "Preserve the approved catalog color" in instruction
 
 
 def test_retry_planner_requeues_existing_failed_retry_job_without_output(
@@ -3163,6 +3623,75 @@ def test_provider_error_qa_report_can_be_refreshed(db_session: Session) -> None:
     assert refreshed.id == report.id
     assert refreshed.decision == "pass_preferred"
     assert refreshed.failures_json == []
+
+
+def test_stale_qa_report_refreshes_when_evaluator_version_changes(
+    db_session: Session,
+) -> None:
+    class PassingEvaluator:
+        version = "new_qa_policy"
+
+        def evaluate(self, output: GeneratedOutput, unit: VisualUnit | None) -> dict[str, object]:
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "failures": [],
+                "revision_instruction": None,
+            }
+
+    unit = VisualUnit(
+        id="vu_stale_qa_refresh",
+        sku="CW-BLACK-GLOSS",
+        film_type="color_wrap",
+        color_family="black",
+        finish="gloss",
+        target_usage="detail_scene",
+        source_asset_ids=[],
+        priority=50,
+        status="qa_pending",
+        metadata_json={},
+    )
+    output = GeneratedOutput(
+        id="out_stale_qa_refresh",
+        generation_job_id="job_stale_qa_refresh",
+        visual_unit_id=unit.id,
+        image_uri="unused.png",
+        width=1024,
+        height=1024,
+        status="qa_fail",
+    )
+    report = QAReport(
+        id="qa_stale_qa_refresh",
+        output_id=output.id,
+        total_score=73,
+        decision="revise",
+        risk_score=1,
+        product_accuracy_score=18,
+        material_realism_score=18,
+        vehicle_integrity_score=14,
+        composition_score=8,
+        commercial_readiness_score=14,
+        failures_json=[],
+        revision_instruction=None,
+        evaluator_version="old_qa_policy",
+        policy_version=settings.qa_policy_version,
+        thresholds_json={},
+        raw_json={},
+        is_current=True,
+    )
+    db_session.add_all([unit, output, report])
+    db_session.flush()
+
+    refreshed = QAService(db_session, evaluator=PassingEvaluator()).evaluate(output)
+
+    assert refreshed.id == report.id
+    assert refreshed.evaluator_version == "new_qa_policy"
+    assert refreshed.total_score == 100
+    assert refreshed.decision == "pass_preferred"
 
 
 def test_stage_run_service_records_and_releases_lease(db_session: Session) -> None:

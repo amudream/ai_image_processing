@@ -471,6 +471,36 @@ color reference. The next production improvement should pass the swatch image in
 editing as a visual reference, or add a color-transfer/postprocess adapter before QA, rather than
 relying only on text color instructions.
 
+The generation-side color-drift fix now sends the actual catalog swatch image into OpenAI image
+editing whenever `catalog_swatch_uri` exists. Even no-source catalog hero rows use `/images/edits`
+instead of text-only `/images/generations`, with the swatch uploaded as an `image[]` reference and
+`input_fidelity=high`. If a source image is also used, the adapter uploads source image first and
+the swatch image second, so the prompt can preserve structure from the source while treating the
+swatch as the final color/finish authority. The prompt explicitly says the swatch must not appear as
+a visible card or label in the output; only the perceived film color and material behavior should be
+transferred to the sellable product image. This improves first-pass color stability; strict
+swatch-image QA remains the final publication gate.
+
+The 2026-07-06 v5 swatch-reference batch reran the same 5 full-roll `product_page_main` rows with
+the real swatch image uploaded into generation. The final inspection package is
+`data/review/color_card_sku_review_batch_20260706_v5_swatchref`: all 5 items were exported with
+5 swatches and no missing rows. Published QA scores were `LM-001` 94, `LM-003` 96, `LM-004` 96,
+`LM-005` 97, and `LM-006` 97. `LM-004` still failed the first generated pass because the roll unit
+was too close to a material crop, then a targeted `source_image_edit` used the near-pass generated
+image as the structure source and repaired the visible roll end/core while keeping the LM-004
+swatch as color authority. This establishes the current recovery pattern for hard color-card items:
+first generate with the swatch image as visual reference, then use source-image edit for localized
+roll-core or product-boundary repair instead of repeatedly regenerating the entire scene.
+
+This v5 recovery pattern is now encoded in `RetryPlannerService`: when a
+`catalog_product_hero` output is near pass (`total_score >= 85`, product/material scores at least
+15) and QA failures mention roll-core material accuracy or localized full-roll boundary clarity, the
+next child job switches to `clean_edit` with `generation_mode=source_image_edit`. It uses the failed
+near-pass output as `source_image_uri`, keeps `catalog_swatch_uri` as the color authority, records
+`retry_strategy=localized_roll_core_source_edit`, and limits the revision instruction to repairing
+the roll core, roll-end cross-section, or local full-roll boundary while preserving the approved
+composition and color.
+
 `QA_MIN_PHOTOREALISM_SCORE` is a publication gate for generated images that are factually correct
 but visibly synthetic. The OpenAI QA prompt returns `photorealism_score`; scores below the threshold
 append a high-severity `photorealism_min_score` failure, force retry, and block publish. This gate
@@ -583,6 +613,62 @@ new plan IDs and recovered all 6. The final reconciliation is in
 with the HTML acceptance report at
 `data/reports/color_card_recovery_20260623_v11_final/acceptance_report.html`.
 
+## Vehicle Recolor Production
+
+`plan-vehicle-recolor-production` builds source-backed detail-scene rows by joining the local source
+classification manifest, the AI-screened listing/source manifest, and the locked color-card catalog.
+It uses the local vehicle image for crop, lighting, reflections, and vehicle structure, while the
+catalog swatch remains the final color and finish authority. The plan writes a CSV executable by
+`run-color-card-production`, a JSONL request audit, a summary JSON, and an HTML review table.
+
+```powershell
+python -m app.cli plan-vehicle-recolor-production `
+  --classification-path data/reports/source_classification_20260703/classification_manifest.csv `
+  --selection-manifest-path data/source_curated/alibaba_listing_ai_full_20260703/00_manifest/selection_manifest.csv `
+  --output-dir data/production_runs/vehicle_recolor_production_20260706_auto `
+  --max-sources-per-item 4 `
+  --max-selection-risk-score 35
+```
+
+Run planned rows with the existing color-card executor:
+
+```powershell
+$env:OPENAI_MAX_RETRIES="1"
+$env:OPENAI_REQUEST_TIMEOUT_SECONDS="90"
+$env:OPENAI_TEXT_MODEL="gpt-5.4-mini"
+$env:OPENAI_TEXT_REASONING_EFFORT="low"
+
+python -m app.cli run-color-card-production `
+  --plan-path data/production_runs/vehicle_recolor_production_20260706_auto/vehicle_recolor_plan.csv `
+  --classification-path data/reports/source_classification_20260703/classification_manifest.csv `
+  --generated-dir data/generated/vehicle_recolor_production_20260706_auto `
+  --published-dir data/published/vehicle_recolor_production_20260706_auto_raw `
+  --log-path data/logs/vehicle_recolor_production_20260706_auto.jsonl `
+  --max-jobs 1
+```
+
+The 2026-07-06 auto plan produced 353 source-backed `detail_scene` rows for 90 catalog items. The
+planner now scans partial-panel source images for high-frequency pattern texture before assigning
+them to smooth catalog colors; this prevents a patterned black source from being used for GL-001
+Gloss Piano Black. The plan summary records selected source texture profiles so this filter is
+auditable.
+
+Current stable surface:
+
+- Stable enough for automatic production: cropped `partial_vehicle_panel` source edits where the
+  source is smooth, brand risks are removable, and the target is a regular catalog color/finish.
+- Usable but lower priority: `full_vehicle_effect` rows. Real smoke tests show they often fail
+  strict publish gates because wheel center caps, grilles, model identity, or over-clean CGI
+  surfaces remain visible.
+- Not stable for smooth colors: patterned, carbon, marbled, or water-textured partial sources unless
+  the target catalog item itself is a patterned material.
+
+The GL-001 smooth partial smoke test published
+`data/published/vehicle_recolor_production_20260706_auto_gl001_smooth_partial_smoke_raw/color_wrap/black/gloss/GL-001_gloss_piano_black/detail_scene/SCENE_CO-BLAC-GLOS_GL-001_out_c07d068e2bd6fd78.png`
+with QA `pass_usable`, score 86, and no QA failures after one retry. The QA evaluator prompt was
+updated to v3 to make `risk_score` explicitly higher-is-better; older QA rows are refreshed when the
+evaluator or policy version changes instead of being reused blindly.
+
 For local high-throughput color-card production against SQLite, enable WAL and a longer busy
 timeout:
 
@@ -629,6 +715,14 @@ an explicit route, target usage, publish role, retryable failure axes, and deter
 - installed, retail, scene, window-tint, and installation images -> `clean_edit` detail assets
 - person portraits or explicitly rejected sources -> `exclude`
 
+The loop has a hard stage boundary. Source classification and listing-material screening may reject,
+exclude, or route images to low-confidence/manual-review folders because those stages decide whether
+an input image is worth using. Once a row enters image generation, the objective changes to producing
+a publishable asset. A generated output that cannot pass publish gates is treated as a repair signal,
+not as a successful terminal result: `revise` and `reject_or_rebrief` QA decisions enqueue another
+generation/rebrief attempt while retry budget remains, and the next attempt must carry the QA failure
+reason in the persisted retry plan.
+
 `VisualUnitService` persists the policy decision in `VisualUnit.metadata_json["scenario_policy"]`.
 `VisualDirectorService` then uses that route when creating the brief, so grouping, prompting, QA,
 retry, and publishing operate from the same decision instead of reclassifying the image differently
@@ -640,6 +734,31 @@ Color or material failures lock the catalog reference, layout failures preserve 
 panel count, readable-text failures move product facts to deterministic template overlays, and
 human-subject failures abort instead of producing more images. Intermediate attempts stay in loop
 history; only QA-passed outputs that meet publish gates are written to the published library.
+Near-pass catalog full-roll outputs with localized roll-core or full-roll boundary failures use a
+separate `localized_roll_core_source_edit` strategy: the previous generated output becomes the
+source image for a local edit, rather than restarting the whole scene from random generation.
+The synchronous pipeline, DB-backed queue pipeline, and color-card production executor all follow
+this repair-until-publishable rule; they stop only when an output is published, the generation retry
+budget is exhausted, a non-retryable failure such as a human-subject scenario is planned, or an
+external provider error must be resumed by a later idempotent run.
+
+## Color Card Production Standards
+
+Color-wrap catalog main images must represent real wide-format automotive wrap inventory, not just
+an attractive colored sheet. For catalog sizes such as `1.52*16.5m`, the main product should read as
+a commercial 1.52 m / 60-inch wide roll with 16.5 m inventory scale, a long high-aspect roll body,
+and a broad vehicle-panel-width film web. Short stubby rolls, gift-wrap rolls, narrow tape rolls,
+ribbons, decal sheets, tiny sample rolls, or handheld samples cannot be the main product image.
+
+Visible roll ends must follow the reinforced paper-core rule: dominant white or off-white inner
+opening, white inner wall, cream/beige paper only as a narrow rim, hollow 3-inch paper-core
+geometry, and no black, brown kraft, glossy plastic, metal, solid, foam, acrylic, colored, or
+material-colored cores unless an exact source image proves that specific product core.
+
+Detail and material images may use macro crops, but they must still imply large wide-format
+automotive film through broad sheet surfaces, realistic rolled-layer thickness, flexible 7mil
+PET/vinyl edges, and vehicle-panel-scale geometry. They must not read as small sticker stock or
+rigid acrylic sample plates.
 
 ## Reports and Logs
 
@@ -707,6 +826,12 @@ and approved publish assets to `data/published`.
   wheel badges, readable signage, watermarks, and license plates may still fail after automatic
   retries; those outputs must remain unpublished until a better mask/detection pass or manual review
   clears them.
+- Localized roll-core source edits are only selected for near-pass catalog hero outputs. Global
+  color drift, low photorealism, weak composition, or low product/material scores still require
+  regeneration or a different recovery route.
+- Automotive wrap roll dimensions are enforced through prompt constraints and visual QA guardrails.
+  The system does not yet perform deterministic physical scale measurement from pixels, so ambiguous
+  close crops can still require manual review or stricter rebriefing.
 - Ecommerce main-image sizing is deterministic after generation: the model output is normalized to
   `ECOMMERCE_IMAGE_SIZE` before QA and publishing.
 - Real provider quality varies by category. Safe material crops significantly reduce brand/model

@@ -8,7 +8,12 @@ from typing import cast
 from sqlalchemy.orm import Session
 
 from app.core.ids import stable_id
-from app.core.product_specs import ROLL_CORE_PAPER_TUBE_REVISION, ROLL_CORE_PAPER_TUBE_SPEC
+from app.core.product_specs import (
+    AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION,
+    AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC,
+    ROLL_CORE_PAPER_TUBE_REVISION,
+    ROLL_CORE_PAPER_TUBE_SPEC,
+)
 from app.models import GeneratedOutput, GenerationJob, PromptRecord, QAReport
 
 
@@ -23,7 +28,23 @@ class RetryPlannerService:
         failed_types = [str(failure.get("type", "unknown")) for failure in report.failures_json]
         failure_axes = self._failure_axes(report)
         retry_type = self._retry_type(report)
-        retry_strategy = self._retry_strategy(failure_axes, retry_type)
+        use_localized_source_edit = self._requires_localized_source_edit_repair(report)
+        retry_strategy = (
+            "localized_roll_core_source_edit"
+            if use_localized_source_edit
+            else self._retry_strategy(failure_axes, retry_type)
+        )
+        next_route = (
+            "clean_edit"
+            if use_localized_source_edit
+            else self._next_route(report, failure_axes)
+        )
+        deterministic_actions = self._deterministic_actions(failure_axes)
+        if use_localized_source_edit:
+            deterministic_actions.append("repair_roll_core_or_hide_wrong_roll_end")
+            deterministic_actions.append("preserve_previous_output_composition")
+            deterministic_actions.append("lock_catalog_swatch_reference")
+        deterministic_actions = list(dict.fromkeys(deterministic_actions))
         revision_instruction = self._typed_revision_instruction(
             retry_type,
             self._revision_instruction(report),
@@ -36,8 +57,8 @@ class RetryPlannerService:
             "failure_axes": failure_axes,
             "retry_type": retry_type,
             "retry_strategy": retry_strategy if revision_instruction else "abort",
-            "next_route": self._next_route(report, failure_axes),
-            "deterministic_actions": self._deterministic_actions(failure_axes),
+            "next_route": next_route,
+            "deterministic_actions": deterministic_actions,
             "publish_blocking": self._publish_blocking(failure_axes),
             "changes": [
                 {
@@ -65,11 +86,26 @@ class RetryPlannerService:
         if failed_job.attempt >= max_attempts or not revision_instruction:
             return None
         retry_id = f"{failed_job.id}_retry{failed_job.attempt + 1}"
+        retry_route = self._retry_route(failed_job, report, plan)
         request_json = {
             **failed_job.request_json,
             "revision_instruction": self._compile_revision_instruction(report, plan),
             "retry_plan": plan,
         }
+        if str(plan.get("retry_strategy")) == "localized_roll_core_source_edit":
+            source_image_uri = self._source_image_uri_for_retry(report)
+            request_json.update(
+                {
+                    "generation_mode": "source_image_edit",
+                    "source_image_uri": source_image_uri,
+                    "source_edit_strategy": "localized_roll_core_repair",
+                    "source_risk_regions": [
+                        "visible roll core",
+                        "roll-end cross-section",
+                        "full-roll boundary",
+                    ],
+                }
+            )
         existing = self.db.get(GenerationJob, retry_id)
         if existing is not None:
             existing_output = self.db.query(GeneratedOutput.id).filter_by(
@@ -87,6 +123,8 @@ class RetryPlannerService:
                 existing.error_message = None
                 existing.available_at = datetime.now(UTC)
                 existing.priority = failed_job.priority
+                existing.route = retry_route
+                existing.retry_reason = revision_instruction
                 existing.status = "queued"
                 self.db.add(existing)
                 self.db.flush()
@@ -96,7 +134,7 @@ class RetryPlannerService:
             id=retry_id,
             prompt_id=failed_job.prompt_id,
             visual_unit_id=failed_job.visual_unit_id,
-            route=failed_job.route,
+            route=retry_route,
             model=failed_job.model,
             request_json=request_json,
             status="queued",
@@ -129,6 +167,24 @@ class RetryPlannerService:
             f"Deterministic actions required: {deterministic_actions}.\n"
         )
         job = report.output.generation_job if report.output else None
+        if str(plan.get("retry_strategy")) == "localized_roll_core_source_edit":
+            return (
+                f"{base}\n"
+                f"Failed QA types: {failed_types}.\n"
+                f"{axis_context}"
+                "Use the previous generated output as the source image for a localized "
+                "source-image edit. Preserve the approved catalog color, finish, lighting, "
+                "camera angle, composition, product count, background, and full-roll selling "
+                "intent. Only repair the reported roll core, roll-end cross-section, or "
+                "full-roll boundary defect; if the wrong core cannot be corrected cleanly, hide "
+                "or crop that local wrong-core detail while keeping the product clearly sellable "
+                "as a full roll. Any visible core must read as a white or off-white paper tube. "
+                f"{AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION} "
+                f"{ROLL_CORE_PAPER_TUBE_REVISION} Keep the uploaded catalog "
+                "swatch as the color reference, but do not render the swatch itself unless it "
+                "already exists in the source composition. Do not add text, logos, vehicles, "
+                "license plates, QR codes, or new claims."
+            )
         if job is not None and job.route == "clean_edit":
             return (
                 f"{base}\n"
@@ -184,6 +240,8 @@ class RetryPlannerService:
                 "subtle imperfect cuts. Do not render rigid acrylic slabs, thick plastic cards, "
                 "rounded solid plates, or stiff molded panels. Lock the catalog color and finish "
                 "across every roll, sheet, and sample. "
+                f"{AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC} "
+                f"{AUTOMOTIVE_WRAP_ROLL_GEOMETRY_REVISION} "
                 f"{ROLL_CORE_PAPER_TUBE_SPEC} "
                 f"{ROLL_CORE_PAPER_TUBE_REVISION} "
                 "Do not switch to a vehicle scene or a "
@@ -423,6 +481,12 @@ class RetryPlannerService:
             )
         if base is None:
             return None
+        if retry_strategy == "localized_roll_core_source_edit":
+            return (
+                "Reuse the previous near-pass generated output as the source image and perform "
+                "a localized source-image edit. Preserve the accepted composition and catalog "
+                f"color while repairing only the roll core or roll-end defect. {base}"
+            )
         if "text_risk" in failure_axes:
             return (
                 "Remove AI-readable text from the image generation step. Reserve item codes, "
@@ -451,3 +515,62 @@ class RetryPlannerService:
                 f"structure and material facts. {base}"
             )
         return base
+
+    def _retry_route(
+        self,
+        failed_job: GenerationJob,
+        report: QAReport,
+        plan: dict[str, object],
+    ) -> str:
+        if str(plan.get("retry_strategy")) == "localized_roll_core_source_edit":
+            return "clean_edit"
+        return failed_job.route
+
+    def _source_image_uri_for_retry(self, report: QAReport) -> str | None:
+        if report.output is None:
+            return None
+        return report.output.image_uri
+
+    def _requires_localized_source_edit_repair(self, report: QAReport) -> bool:
+        job = report.output.generation_job if report.output else None
+        if job is None or job.route != "catalog_product_hero":
+            return False
+        if not self._source_image_uri_for_retry(report):
+            return False
+        if report.total_score < 85:
+            return False
+        if report.product_accuracy_score < 15 or report.material_realism_score < 15:
+            return False
+        blob = self._failure_blob(report)
+        roll_core_terms = (
+            "roll_core_material_accuracy_required",
+            "roll_core_product_accuracy",
+            "roll_core_paper_tube_required",
+            "roll_core_must_be_white_offwhite_paper_tube",
+            "wrong roll core",
+            "colored core",
+            "material-colored core",
+            "dark core",
+            "gray core",
+            "grey core",
+            "black core",
+            "paper tube",
+            "roll-end cross-section",
+            "roll end",
+            "visible roll core",
+        )
+        if any(term in blob for term in roll_core_terms):
+            return True
+        localized_full_roll_terms = (
+            "sellable_full_roll_unit_clarity",
+            "full-roll unit clarity",
+            "full roll unit clarity",
+            "full-roll boundary",
+            "full roll boundary",
+            "roll boundary",
+        )
+        if report.composition_score >= 7 and any(
+            term in blob for term in localized_full_roll_terms
+        ):
+            return True
+        return False

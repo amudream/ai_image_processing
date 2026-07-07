@@ -82,15 +82,18 @@ class OpenAIImageGenerationAdapter:
             )
 
         source_path = self._source_image_path(job)
-        if source_path is not None:
+        input_image_paths = self._input_image_paths(job, source_path)
+        if input_image_paths:
             endpoint = "images/edits"
-            payload = self._edit_payload(prompt, source_path, job)
+            payload = self._edit_payload(prompt, input_image_paths[0], job)
             request_path.write_text(
                 json.dumps(
                     {
                         "endpoint": endpoint,
                         "payload": payload,
-                        "source_image_uri": str(source_path),
+                        "source_image_uri": str(source_path) if source_path is not None else None,
+                        "input_image_uris": [str(path) for path in input_image_paths],
+                        "catalog_swatch_uri": job.request_json.get("catalog_swatch_uri", ""),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -98,7 +101,7 @@ class OpenAIImageGenerationAdapter:
                 encoding="utf-8",
             )
             with httpx.Client(timeout=settings.openai_request_timeout_seconds) as client:
-                response = self._post_edit_with_retries(client, payload, source_path)
+                response = self._post_edit_with_retries(client, payload, input_image_paths)
                 response.raise_for_status()
                 body = response.json()
         else:
@@ -140,6 +143,7 @@ class OpenAIImageGenerationAdapter:
             "response_uri": str(response_path.resolve()),
             "raw_image_uri": str(raw_image_path.resolve()),
             "source_image_uri": str(source_path.resolve()) if source_path is not None else None,
+            "input_image_uris": [str(path.resolve()) for path in input_image_paths],
         }
 
     def _source_image_path(self, job: GenerationJob) -> Path | None:
@@ -158,6 +162,26 @@ class OpenAIImageGenerationAdapter:
             raise FileNotFoundError(f"Source image for edit does not exist: {source_path}")
         return source_path
 
+    def _input_image_paths(self, job: GenerationJob, source_path: Path | None) -> list[Path]:
+        paths: list[Path] = []
+        if source_path is not None:
+            paths.append(source_path)
+        swatch_path = self._catalog_swatch_path(job)
+        if swatch_path is not None and swatch_path not in paths:
+            paths.append(swatch_path)
+        return paths
+
+    def _catalog_swatch_path(self, job: GenerationJob) -> Path | None:
+        catalog_swatch_uri = job.request_json.get("catalog_swatch_uri")
+        if not catalog_swatch_uri:
+            return None
+        swatch_path = Path(str(catalog_swatch_uri))
+        if not swatch_path.exists():
+            raise FileNotFoundError(
+                f"Catalog swatch reference for image generation does not exist: {swatch_path}"
+            )
+        return swatch_path
+
     def _edit_payload(
         self, prompt: str, source_path: Path, job: GenerationJob | None = None
     ) -> dict[str, object]:
@@ -169,6 +193,7 @@ class OpenAIImageGenerationAdapter:
             "quality": "high",
             "background": "auto",
             "output_format": "png",
+            "input_fidelity": "high",
             "source_filename": source_path.name,
             "source_risk_regions": job.request_json.get("source_risk_regions", [])
             if job is not None
@@ -273,13 +298,16 @@ class OpenAIImageGenerationAdapter:
         raise RuntimeError("OpenAI image generation request failed") from last_error
 
     def _post_edit_with_retries(
-        self, client: httpx.Client, payload: dict[str, object], source_path: Path
+        self,
+        client: httpx.Client,
+        payload: dict[str, object],
+        input_paths: Path | list[Path],
     ) -> httpx.Response:
         last_error: Exception | None = None
         max_retries = max(1, settings.openai_max_retries)
         for attempt in range(1, max_retries + 1):
             try:
-                response = self._post_edit_once(client, payload, source_path)
+                response = self._post_edit_once(client, payload, input_paths)
                 response.raise_for_status()
                 return response
             except httpx.HTTPError as exc:
@@ -290,16 +318,22 @@ class OpenAIImageGenerationAdapter:
         raise RuntimeError("OpenAI image edit request failed") from last_error
 
     def _post_edit_once(
-        self, client: httpx.Client, payload: dict[str, object], source_path: Path
+        self,
+        client: httpx.Client,
+        payload: dict[str, object],
+        input_paths: Path | list[Path],
     ) -> httpx.Response:
         response: httpx.Response | None = None
-        upload_name, upload_bytes, mime_type = self._source_image_upload(source_path)
-        mask_upload = self._source_mask_upload(source_path, self._source_risk_regions(payload))
+        normalized_input_paths = self._normalized_input_paths(input_paths)
+        uploads = [self._source_image_upload(path) for path in normalized_input_paths]
+        mask_upload = self._source_mask_upload(
+            normalized_input_paths[0], self._source_risk_regions(payload)
+        )
         for candidate in self._edit_payload_fallbacks(payload):
-            files = {"image": (upload_name, upload_bytes, mime_type)}
+            files = self._edit_image_files(uploads)
             if mask_upload is not None:
                 mask_name, mask_bytes, mask_mime_type = mask_upload
-                files["mask"] = (mask_name, mask_bytes, mask_mime_type)
+                files.append(("mask", (mask_name, mask_bytes, mask_mime_type)))
             data = {
                 key: str(value)
                 for key, value in candidate.items()
@@ -316,6 +350,17 @@ class OpenAIImageGenerationAdapter:
         if response is None:
             raise RuntimeError("OpenAI image edit request did not send a request")
         return response
+
+    def _normalized_input_paths(self, input_paths: Path | list[Path]) -> list[Path]:
+        paths = [input_paths] if isinstance(input_paths, Path) else list(input_paths)
+        if not paths:
+            raise ValueError("At least one input image is required for image editing")
+        return paths
+
+    def _edit_image_files(
+        self, uploads: list[tuple[str, bytes, str]]
+    ) -> list[tuple[str, tuple[str, bytes, str]]]:
+        return [("image[]", upload) for upload in uploads]
 
     def _source_image_upload(self, source_path: Path) -> tuple[str, bytes, str]:
         buffer = BytesIO()
@@ -447,6 +492,7 @@ class OpenAIImageGenerationAdapter:
         return (
             f"{self._source_edit_instruction(job)}{prompt}\n\n"
             f"{self._revision_instruction(job)}"
+            f"{self._input_reference_instruction(job)}"
             f"{self._product_fact_instruction(job)}"
             f"{self._color_card_instruction(job)}"
             "Brand/model safety and hard constraints:\n"
@@ -464,6 +510,27 @@ class OpenAIImageGenerationAdapter:
         return (
             "Retry/rebrief instruction. This attempt must fix the previous QA failures:\n"
             f"{revision.strip()}\n\n"
+        )
+
+    def _input_reference_instruction(self, job: GenerationJob) -> str:
+        if not job.request_json.get("catalog_swatch_uri"):
+            return ""
+        source_clause = (
+            "If a source image is also uploaded, use it for structure/composition only where "
+            "the generation mode requires source preservation; use the catalog swatch as the "
+            "final color and finish authority."
+            if job.request_json.get("source_image_uri")
+            else "If this is otherwise a text-to-image request, the uploaded image is not a base "
+            "composition; it is only the color and finish reference."
+        )
+        return (
+            "Uploaded catalog swatch reference image protocol: use the uploaded catalog swatch "
+            "reference image as the exact visual calibration target for automotive-film base "
+            "color, value, hue direction, finish, metallic/pearl/chameleon behavior, and gloss. "
+            "The swatch image must not appear as a visible card or label in the output; do not "
+            "copy its printed text, border, background, glare stripe, or crop. Transfer only the "
+            "perceived film color and material behavior onto the generated sellable product. "
+            f"{source_clause}\n\n"
         )
 
     def _product_fact_instruction(self, job: GenerationJob) -> str:

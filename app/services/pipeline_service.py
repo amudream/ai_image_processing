@@ -99,112 +99,78 @@ class PipelineService:
             prompt = compiler.compile_prompt(brief)
             self._log("prompt_ready", visual_unit_id=unit.id, prompt_id=prompt.id)
             job = generator.enqueue(prompt, priority=unit.priority)
-            attempted_generation_jobs += 1
-            self._log("generation_started", visual_unit_id=unit.id, job_id=job.id)
-            try:
-                output = generator.run(job)
-            except Exception as exc:
+            current_job = job
+            while attempted_generation_jobs < generation_budget:
+                is_retry = current_job.id != job.id
+                attempted_generation_jobs += 1
                 self._log(
-                    "generation_failed",
+                    "retry_generation_started" if is_retry else "generation_started",
                     visual_unit_id=unit.id,
-                    job_id=job.id,
-                    error_message=str(exc),
+                    job_id=current_job.id,
+                    source_job_id=current_job.parent_job_id,
                 )
-                continue
-            self._log(
-                "generation_succeeded",
-                visual_unit_id=unit.id,
-                job_id=job.id,
-                output_id=output.id,
-                image_uri=output.image_uri,
-            )
-            report = qa.evaluate(output)
-            self._log(
-                "qa_completed",
-                visual_unit_id=unit.id,
-                output_id=output.id,
-                qa_report_id=report.id,
-                decision=report.decision,
-                total_score=report.total_score,
-                failure_count=len(report.failures_json),
-            )
-            if can_publish(report):
-                published = publisher.publish(output)
+                try:
+                    output = generator.run(current_job)
+                except Exception as exc:
+                    self._log(
+                        "retry_generation_failed" if is_retry else "generation_failed",
+                        visual_unit_id=unit.id,
+                        job_id=current_job.id,
+                        source_job_id=current_job.parent_job_id,
+                        error_message=str(exc),
+                    )
+                    break
                 self._log(
-                    "published",
+                    "retry_generation_succeeded" if is_retry else "generation_succeeded",
+                    visual_unit_id=unit.id,
+                    job_id=current_job.id,
+                    output_id=output.id,
+                    image_uri=output.image_uri,
+                )
+                report = qa.evaluate(output)
+                self._log(
+                    "retry_qa_completed" if is_retry else "qa_completed",
                     visual_unit_id=unit.id,
                     output_id=output.id,
-                    published_asset_id=published.id,
-                    final_uri=published.final_uri,
-                )
-            elif report.decision in {"pass_preferred", "pass_usable"}:
-                self._log(
-                    "publish_blocked",
-                    visual_unit_id=unit.id,
-                    output_id=output.id,
+                    qa_report_id=report.id,
                     decision=report.decision,
                     total_score=report.total_score,
-                    risk_score=report.risk_score,
-                    product_accuracy_score=report.product_accuracy_score,
-                    material_realism_score=report.material_realism_score,
+                    failure_count=len(report.failures_json),
                 )
-            elif report.decision == "revise":
-                retry_job = retry_planner.create_retry_job(job, report)
-                if retry_job is not None and attempted_generation_jobs < generation_budget:
-                    attempted_generation_jobs += 1
+                if can_publish(report):
+                    published = publisher.publish(output)
                     self._log(
-                        "retry_generation_started",
+                        "published",
                         visual_unit_id=unit.id,
-                        job_id=retry_job.id,
-                        source_job_id=job.id,
+                        output_id=output.id,
+                        published_asset_id=published.id,
+                        final_uri=published.final_uri,
                     )
-                    try:
-                        retry_output = generator.run(retry_job)
-                    except Exception as exc:
-                        self._log(
-                            "retry_generation_failed",
-                            visual_unit_id=unit.id,
-                            job_id=retry_job.id,
-                            source_job_id=job.id,
-                            error_message=str(exc),
-                        )
-                        continue
+                    break
+                if report.decision not in {"revise", "reject_or_rebrief"}:
                     self._log(
-                        "retry_generation_succeeded",
+                        "publish_blocked",
                         visual_unit_id=unit.id,
-                        job_id=retry_job.id,
-                        output_id=retry_output.id,
+                        output_id=output.id,
+                        decision=report.decision,
+                        total_score=report.total_score,
+                        risk_score=report.risk_score,
+                        product_accuracy_score=report.product_accuracy_score,
+                        material_realism_score=report.material_realism_score,
                     )
-                    retry_report = qa.evaluate(retry_output)
+                    break
+                retry_job = retry_planner.create_retry_job(current_job, report)
+                if retry_job is None:
                     self._log(
-                        "retry_qa_completed",
+                        "retry_exhausted",
                         visual_unit_id=unit.id,
-                        output_id=retry_output.id,
-                        qa_report_id=retry_report.id,
-                        decision=retry_report.decision,
-                        total_score=retry_report.total_score,
-                        failure_count=len(retry_report.failures_json),
+                        output_id=output.id,
+                        job_id=current_job.id,
+                        decision=report.decision,
+                        total_score=report.total_score,
                     )
-                    if can_publish(retry_report):
-                        published = publisher.publish(retry_output)
-                        self._log(
-                            "published",
-                            visual_unit_id=unit.id,
-                            output_id=retry_output.id,
-                            published_asset_id=published.id,
-                            final_uri=published.final_uri,
-                        )
-                    elif retry_report.decision in {"pass_preferred", "pass_usable"}:
-                        self._log(
-                            "publish_blocked",
-                            visual_unit_id=unit.id,
-                            output_id=retry_output.id,
-                            decision=retry_report.decision,
-                            total_score=retry_report.total_score,
-                            risk_score=retry_report.risk_score,
-                            product_accuracy_score=retry_report.product_accuracy_score,
-                            material_realism_score=retry_report.material_realism_score,
-                        )
+                    break
+                current_job = retry_job
         self.db.commit()
         result = {
             "imported_assets": imported_assets,

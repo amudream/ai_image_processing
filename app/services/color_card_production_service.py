@@ -17,7 +17,10 @@ from sqlalchemy.orm import Session
 
 from app.adapters.image_generation import ImageGenerationAdapter
 from app.core.ids import sha256_file, stable_id
-from app.core.product_specs import ROLL_CORE_PAPER_TUBE_SPEC
+from app.core.product_specs import (
+    AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC,
+    ROLL_CORE_PAPER_TUBE_SPEC,
+)
 from app.core.states import VisualUnitStatus
 from app.models import (
     GeneratedOutput,
@@ -330,7 +333,10 @@ class ColorCardProductionService:
         retry_jobs = []
         published_this_row = False
         provider_error_after_retry = False
-        while not can_publish(final_report) and final_report.decision == "revise":
+        while (
+            not can_publish(final_report)
+            and final_report.decision in {"revise", "reject_or_rebrief"}
+        ):
             retry_job = RetryPlannerService(db).create_retry_job(final_job, final_report)
             if retry_job is not None:
                 retry_jobs.append(retry_job)
@@ -489,6 +495,7 @@ class ColorCardProductionService:
             "tiny dust specks, subtle handling marks, non-perfect film edges, soft contact "
             "shadows, and visible layered PET/vinyl thickness at curled sheet edges. "
             f"{self._exact_swatch_color_instruction(item)} "
+            f"{AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC} "
             f"{ROLL_CORE_PAPER_TUBE_SPEC} "
             f"{self._solid_material_instruction(item)}"
         )
@@ -641,6 +648,7 @@ class ColorCardProductionService:
             "marks, soft contact shadows, and one consistent locked catalog color/finish. "
             "Prefer no visible roll core; crop, hide, or turn away roll ends unless the "
             "composition truly requires one. "
+            f"{AUTOMOTIVE_WRAP_ROLL_GEOMETRY_SPEC} "
             f"{ROLL_CORE_PAPER_TUBE_SPEC} Avoid rigid acrylic "
             "cards, thick molded panels, complete vehicles, readable text, badges, or logos."
         )
@@ -704,6 +712,10 @@ class ColorCardProductionService:
                     "Catalog hero/product_page_main outputs must show a sellable "
                     "full-roll unit: one dominant full-width roll or large full commercial "
                     "roll with a partly unrolled continuous film web.",
+                    "Commercial roll geometry must match wide-format automotive wrap inventory: "
+                    "about 1.52 m / 60 inches wide and 16.5 m long when catalog size is "
+                    "1.52*16.5m; no short stubby roll, narrow tape roll, ribbon, decal sheet, "
+                    "or tiny sample roll as the main product.",
                     "Sample-only composition is prohibited: loose sample cards, cut pieces, "
                     "swatch sheets, or material scraps may appear only as secondary scale/detail "
                     "references.",
@@ -742,7 +754,9 @@ class ColorCardProductionService:
                 "geometry, no invented catalog colors, no flat paint-like surface, no colored "
                 "plastic, metal, solid, glossy, black, brown kraft, or material-colored roll "
                 "cores in no-reference generated catalog heroes, no sample-only composition, "
-                "no loose cut pieces as the main subject, no swatch-card-only main image."
+                "no loose cut pieces as the main subject, no swatch-card-only main image, "
+                "no short stubby roll, no narrow tape-like roll, no ribbon roll, no tiny "
+                "sample roll as the main product."
             ),
             hard_constraints_json=json.dumps(hard_constraints, ensure_ascii=False),
             generation_mode=generation_mode,

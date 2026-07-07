@@ -45,6 +45,9 @@ from app.services.publish_service import PublishingService
 from app.services.qa_service import QAService, can_publish
 from app.services.report_service import ReportService
 from app.services.source_classification_service import SourceClassificationService
+from app.services.vehicle_recolor_production_service import (
+    VehicleRecolorProductionService,
+)
 from app.services.visual_unit_service import VisualUnitService
 from app.services.watermark_detection_service import AIWatermarkDetectionService
 
@@ -497,6 +500,49 @@ def plan_color_card_production(
     )
     typer.echo(
         "Color-card production artifacts exported: "
+        f"production_plan={result.production_plan_path} "
+        f"generation_requests={result.generation_requests_path} "
+        f"summary={result.summary_path} "
+        f"html={result.html_report_path}"
+    )
+
+
+@app.command("plan-vehicle-recolor-production")
+def plan_vehicle_recolor_production(
+    classification_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path("data/reports/source_classification_20260703/classification_manifest.csv"),
+    selection_manifest_path: Annotated[
+        Path,
+        typer.Option(),
+    ] = Path(
+        "data/source_curated/alibaba_listing_ai_full_20260703/00_manifest/"
+        "selection_manifest.csv"
+    ),
+    catalog_path: Annotated[Path | None, typer.Option()] = None,
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    max_sources_per_item: Annotated[int, typer.Option()] = 4,
+    max_selection_risk_score: Annotated[int, typer.Option()] = 35,
+) -> None:
+    active_catalog_path = catalog_path or Path(settings.color_card_catalog_path)
+    active_output_dir = output_dir or (
+        Path("data/production_runs")
+        / datetime.now(UTC).strftime("vehicle_recolor_production_%Y%m%dT%H%M%SZ")
+    )
+    result = VehicleRecolorProductionService(
+        classification_path=classification_path,
+        selection_manifest_path=selection_manifest_path,
+        catalog_path=active_catalog_path,
+        max_sources_per_item=max_sources_per_item,
+        max_selection_risk_score=max_selection_risk_score,
+    ).plan(active_output_dir)
+    typer.echo(
+        "Vehicle recolor production plan complete: "
+        f"total_plan_rows={result.total_plan_rows}"
+    )
+    typer.echo(
+        "Vehicle recolor production artifacts exported: "
         f"production_plan={result.production_plan_path} "
         f"generation_requests={result.generation_requests_path} "
         f"summary={result.summary_path} "

@@ -167,6 +167,10 @@ def test_plans_catalog_hero_for_each_catalog_item(tmp_path: Path) -> None:
     assert "1.52*16.5m" in hero_prompt.lower()
     assert "one dominant full-width roll" in hero_prompt.lower()
     assert "partly unrolled continuous film web" in hero_prompt.lower()
+    assert "1.52 m / 60 inches wide" in hero_prompt.lower()
+    assert "long high-aspect horizontal cylinder" in hero_prompt.lower()
+    assert "short stubby roll" in hero_prompt.lower()
+    assert "narrow tape roll" in hero_prompt.lower()
     assert "exact-swatch color calibration" in hero_prompt.lower()
     assert "#500B0E".lower() in hero_prompt.lower()
     assert "do not let highlights change the perceived base color" in hero_prompt.lower()
@@ -174,7 +178,10 @@ def test_plans_catalog_hero_for_each_catalog_item(tmp_path: Path) -> None:
     assert "sample-only" in hero_negative_prompt
     assert "loose cut pieces as the main subject" in hero_negative_prompt
     assert "sellable full-roll unit" in hero_hard_constraints
+    assert "commercial roll geometry" in hero_hard_constraints
+    assert "1.52 m / 60 inches wide" in hero_hard_constraints
     assert "sample-only composition" in hero_hard_constraints
+    assert "narrow tape-like roll" in hero_negative_prompt
     assert "prefer compositions where roll ends and inner cores are cropped" in hero_prompt.lower()
     assert (
         "primary product evidence should be freestanding swatch sheets"
@@ -270,6 +277,8 @@ def test_catalog_hero_recovery_preserves_paper_tube_core_spec(tmp_path: Path) ->
     assert recovery_rows[0]["route"] == "catalog_product_hero"
     assert "full commercial roll" in prompt
     assert "sellable full-roll unit" in prompt
+    assert "1.52 m / 60 inches" in prompt
+    assert "short stubby roll" in prompt
     assert "sample-only" in prompt
     assert "prefer no visible roll core" in prompt
     assert "crop, hide, or turn away roll ends" in prompt
@@ -740,6 +749,105 @@ def test_execute_plan_retries_revised_output_before_publish(
     assert log_rows[0]["status"] == "succeeded_after_retry"
     assert log_rows[0]["initial_qa_decision"] == "revise"
     assert log_rows[0]["retry_generation_job_id"] == retry_jobs[-1].id
+
+
+def test_execute_plan_rebriefs_rejected_generated_output_before_publish(
+    tmp_path: Path, db_session: Session
+) -> None:
+    class RebriefThenPassQAEvaluator:
+        version = "rebrief_then_pass"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, _output: object, _unit: object) -> dict[str, object]:
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "risk_score": 8,
+                    "product_accuracy_score": 9,
+                    "material_realism_score": 9,
+                    "vehicle_integrity_score": 8,
+                    "composition_score": 4,
+                    "commercial_readiness_score": 4,
+                    "photorealism_score": 10,
+                    "structure_preservation_score": 10,
+                    "failures": [
+                        {
+                            "type": "composition",
+                            "severity": "high",
+                            "rule_id": "generated_product_not_publishable",
+                            "issue": "Generated product image is not publishable.",
+                        }
+                    ],
+                    "revision_instruction": None,
+                    "evaluator": self.version,
+                }
+            return {
+                "risk_score": 20,
+                "product_accuracy_score": 20,
+                "material_realism_score": 20,
+                "vehicle_integrity_score": 15,
+                "composition_score": 10,
+                "commercial_readiness_score": 15,
+                "photorealism_score": 19,
+                "structure_preservation_score": 20,
+                "failures": [],
+                "revision_instruction": None,
+                "evaluator": self.version,
+            }
+
+    catalog_path = tmp_path / "catalog.json"
+    classification_path = tmp_path / "classification.csv"
+    source_path = tmp_path / "source.jpg"
+    source_path.write_bytes(b"fake")
+    _catalog(catalog_path)
+    _write_classification(
+        classification_path,
+        [
+            _classification_row(
+                item_no="LM-001",
+                color_family="red",
+                finish="metallic",
+                source_path=source_path,
+            )
+        ],
+    )
+    service = ColorCardProductionService(
+        classification_path=classification_path,
+        catalog_path=catalog_path,
+    )
+    plan_result = service.plan(tmp_path / "production")
+    evaluator = RebriefThenPassQAEvaluator()
+
+    result = service.execute_plan(
+        db=db_session,
+        plan_path=plan_result.production_plan_path,
+        max_jobs=1,
+        generated_dir=tmp_path / "generated",
+        published_dir=tmp_path / "published",
+        log_path=tmp_path / "run.jsonl",
+        adapter=MockImageGenerationAdapter(output_dir=tmp_path / "generated"),
+        qa_evaluator=evaluator,
+    )
+
+    log_rows = [
+        json.loads(line)
+        for line in (tmp_path / "run.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    retry_jobs = (
+        db_session.query(GenerationJob)
+        .filter(GenerationJob.parent_job_id.is_not(None))
+        .order_by(GenerationJob.attempt)
+        .all()
+    )
+    assert result.generated == 2
+    assert result.qa_passed == 1
+    assert result.published == 1
+    assert evaluator.calls == 2
+    assert [job.attempt for job in retry_jobs] == [2]
+    assert log_rows[0]["status"] == "succeeded_after_retry"
+    assert log_rows[0]["initial_qa_decision"] == "reject_or_rebrief"
 
 
 def test_execute_plan_marks_qa_provider_error_failed_but_resumable(
